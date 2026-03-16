@@ -160,13 +160,9 @@ function fileToBase64(file) {
 
 async function extractStatementFromPdf(file) {
   const base64 = await fileToBase64(file);
-  const apiKey = import.meta.env?.VITE_ANTHROPIC_KEY || "";
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetch("/api/claude-proxy", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(apiKey ? { "x-api-key": apiKey, "anthropic-version": "2023-06-01" } : {}),
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514", max_tokens: 1000,
       messages: [{ role: "user", content: [
@@ -196,13 +192,9 @@ If not found, use 0. Return only the JSON.` }
 
 async function extractHoldingsFromPdf(file) {
   const base64 = await fileToBase64(file);
-  const apiKey = import.meta.env?.VITE_ANTHROPIC_KEY || "";
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetch("/api/claude-proxy", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(apiKey ? { "x-api-key": apiKey, "anthropic-version": "2023-06-01" } : {}),
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514", max_tokens: 4000,
       messages: [{ role: "user", content: [
@@ -1244,15 +1236,15 @@ export default function App() {
   const handleDelete=async(idx)=>{const n=entries.filter((_,i)=>i!==idx);setEntries(n);await saveEntries(n);};
 
   const handlePdfFile=async(file)=>{
-    if(!file||file.type!=="application/pdf"){setPdfStatus("error");return;}
+    if(!file||file.type!=="application/pdf"){setPdfStatus("error: not a PDF");return;}
     setPdfLoading(true);setPdfStatus(null);
     try{
       const extracted=await extractStatementFromPdf(file);
       if(extracted.gross>0){
         setForm(f=>({...f,gross:String(extracted.gross),margin:String(extracted.margin||0),actualDivs:extracted.dividends>0?String(extracted.dividends):f.actualDivs,actualInterest:extracted.interest>0?String(extracted.interest):f.actualInterest,date:extracted.date||f.date}));
         setPdfStatus("success");
-      }else{setPdfStatus("error");}
-    }catch{setPdfStatus("error");}
+      }else{setPdfStatus("error: gross was 0 — check PDF");}
+    }catch(err){setPdfStatus("error: " + (err?.message || String(err)));}
     setPdfLoading(false);
   };
 
@@ -1489,7 +1481,7 @@ export default function App() {
                 <div style={{fontSize:11,fontWeight:700,color:T.textMuted,letterSpacing:"1px",marginBottom:8}}>AUTO-FILL FROM PDF</div>
                 <input type="file" accept="application/pdf" ref={fileInputRef} style={{display:"none"}} onChange={e=>{if(e.target.files[0])handlePdfFile(e.target.files[0]);e.target.value="";}}/>
                 <div className="pdf-drop" onClick={()=>fileInputRef.current?.click()} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();if(e.dataTransfer.files[0])handlePdfFile(e.dataTransfer.files[0]);}}>
-                  {pdfLoading?(<div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,padding:"4px 0"}}><div style={{width:18,height:18,border:`2px solid ${T.border}`,borderTopColor:T.blueMid,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/><span style={{fontSize:12,color:T.textSub}}>Reading your statement…</span></div>):pdfStatus==="success"?(<div style={{fontSize:12,color:T.green,fontWeight:600}}>✓ Statement read — Gross, Margin, Dividends, Interest, and Month auto-filled. Verify before saving.</div>):pdfStatus==="error"?(<div style={{fontSize:12,color:T.red}}>Couldn't extract data. Try a different PDF or enter manually below.</div>):(<div><div style={{fontSize:13,fontWeight:600,color:T.text,marginBottom:4}}>📄 Upload E-Trade Statement PDF</div><div style={{fontSize:11,color:T.textMuted}}>Extracts Gross, Margin, Dividends, Interest, and Month automatically</div></div>)}
+                  {pdfLoading?(<div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,padding:"4px 0"}}><div style={{width:18,height:18,border:`2px solid ${T.border}`,borderTopColor:T.blueMid,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/><span style={{fontSize:12,color:T.textSub}}>Reading your statement…</span></div>):pdfStatus==="success"?(<div style={{fontSize:12,color:T.green,fontWeight:600}}>✓ Statement read — Gross, Margin, Dividends, Interest, and Month auto-filled. Verify before saving.</div>):pdfStatus&&pdfStatus.startsWith("error")?(<div style={{fontSize:12,color:T.red}}>⚠ {pdfStatus}</div>):(<div><div style={{fontSize:13,fontWeight:600,color:T.text,marginBottom:4}}>📄 Upload E-Trade Statement PDF</div><div style={{fontSize:11,color:T.textMuted}}>Extracts Gross, Margin, Dividends, Interest, and Month automatically</div></div>)}
                 </div>
               </div>
             )}
