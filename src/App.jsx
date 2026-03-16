@@ -239,6 +239,127 @@ Include EVERY position listed under Stocks, ETFs & Closed-End Funds sections. Fo
   return JSON.parse(text.replace(/```json|```/g, "").trim());
 }
 
+// ── E-TRADE CSV PARSER ────────────────────────────────────────────────────────
+function parseETradeCSV(text) {
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+
+  // Find the header row — E-Trade CSVs often have account info at top
+  let headerIdx = lines.findIndex(l =>
+    /symbol|ticker/i.test(l) && /quantity|qty/i.test(l)
+  );
+  if (headerIdx === -1) throw new Error("Could not find header row with Symbol and Quantity columns");
+
+  const headers = lines[headerIdx].split(",").map(h => h.trim().replace(/^"|"$/g, "").toLowerCase());
+
+  // Column index helpers
+  const col = (names) => {
+    for (const n of names) {
+      const idx = headers.findIndex(h => h.includes(n));
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  };
+
+  const iSymbol    = col(["symbol", "ticker"]);
+  const iName      = col(["description", "name", "security"]);
+  const iQty       = col(["quantity", "qty", "shares"]);
+  const iPrice     = col(["last price", "price", "last"]);
+  const iMV        = col(["current value", "market value", "value"]);
+  const iCost      = col(["cost basis", "total cost", "cost"]);
+  const iGL        = col(["gain/loss $", "gain/loss dollar", "unrealized gain", "gain $", "gain loss"]);
+  const iEAI       = col(["est. annual income", "annual income", "est annual"]);
+  const iYield     = col(["current yield", "yield %", "yield"]);
+  const iAsset     = col(["asset class", "type", "asset type", "category"]);
+
+  const parseV = (v) => {
+    if (!v) return 0;
+    const s = String(v).replace(/^"|"$/g, "").replace(/[$,%]/g, "").replace(/\(([^)]+)\)/, "-$1").trim();
+    return parseFloat(s) || 0;
+  };
+
+  const positions = [];
+  let totalMV = 0, totalCost = 0, totalGL = 0, totalEAI = 0;
+
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const row = lines[i].split(",").map(c => c.trim().replace(/^"|"$/g, ""));
+    if (!row[iSymbol] || row[iSymbol].toLowerCase() === "symbol") continue;
+
+    // Skip totals/summary rows
+    const sym = row[iSymbol].trim();
+    if (!sym || sym.toLowerCase().includes("total") || sym.toLowerCase().includes("account")) continue;
+    // Skip cash/margin rows
+    if (sym.toLowerCase().includes("cash") || sym === "--" || sym === "") continue;
+
+    const mv    = parseV(row[iMV]);
+    const cost  = parseV(row[iCost]);
+    const gl    = parseV(row[iGL]);
+    const eai   = iEAI !== -1 ? parseV(row[iEAI]) : 0;
+    const yld   = iYield !== -1 ? parseV(row[iYield]) : (mv > 0 && eai > 0 ? (eai / mv) * 100 : 0);
+    const price = parseV(row[iPrice]);
+    const qty   = parseV(row[iQty]);
+
+    if (!mv && !qty) continue; // skip empty rows
+
+    // Guess asset class from symbol/name if not provided
+    let assetClass = "Equities";
+    if (iAsset !== -1 && row[iAsset]) {
+      const ac = row[iAsset].toLowerCase();
+      if (ac.includes("alt") || ac.includes("etf")) assetClass = "Alternatives";
+      else if (ac.includes("fixed") || ac.includes("bond") || ac.includes("pref")) assetClass = "Fixed Income & Pref";
+      else if (ac.includes("cash")) assetClass = "Cash";
+      else assetClass = "Equities";
+    }
+
+    positions.push({
+      ticker: sym,
+      name: iName !== -1 ? row[iName] : sym,
+      quantity: qty,
+      sharePrice: price,
+      totalCost: cost,
+      marketValue: mv,
+      unrealizedGL: gl || (mv - cost),
+      estAnnIncome: eai,
+      currentYield: yld,
+      assetClass,
+    });
+
+    totalMV   += mv;
+    totalCost += cost;
+    totalGL   += (gl || (mv - cost));
+    totalEAI  += eai;
+  }
+
+  if (!positions.length) throw new Error("No positions found — check the CSV format");
+
+  return {
+    date: new Date().toISOString().slice(0, 7),
+    positions,
+    totalAssets: totalMV,
+    marginLoan: 0,
+    netValue: totalMV,
+    allocation: {
+      equities:    positions.filter(p => p.assetClass === "Equities").reduce((s, p) => s + p.marketValue, 0),
+      fixedIncome: positions.filter(p => p.assetClass === "Fixed Income & Pref").reduce((s, p) => s + p.marketValue, 0),
+      alternatives:positions.filter(p => p.assetClass === "Alternatives").reduce((s, p) => s + p.marketValue, 0),
+      cash: 0,
+    },
+    totalEstAnnIncome: totalEAI,
+    totalUnrealizedGL: totalGL,
+  };
+}
+
+async function extractHoldingsFromCsv(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try { resolve(parseETradeCSV(e.target.result)); }
+      catch (err) { reject(err); }
+    };
+    reader.onerror = () => reject(new Error("Could not read CSV file"));
+    reader.readAsText(file);
+  });
+}
+
 // ── MODELER CHART ─────────────────────────────────────────────────────────────
 function ModelerChart({ scenarios, months = 36, growthScenarios = [] }) {
   const W = 700, H = 200, pad = { t: 16, r: 64, b: 32, l: 48 };
@@ -520,10 +641,14 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
   const latest = holdingSnapshots.length ? holdingSnapshots[holdingSnapshots.length - 1] : null;
 
   const handleFile = async (file) => {
-    if (!file || file.type !== "application/pdf") { setUploadStatus("error: not a PDF"); return; }
+    const isPdf = file.type === "application/pdf";
+    const isCsv = file.type === "text/csv" || file.name.endsWith(".csv");
+    if (!isPdf && !isCsv) { setUploadStatus("error: please upload a PDF or CSV file"); return; }
     setUploading(true); setUploadStatus(null);
     try {
-      const data = await extractHoldingsFromPdf(file);
+      const data = isPdf
+        ? await extractHoldingsFromPdf(file)
+        : await extractHoldingsFromCsv(file);
       if (data.positions && data.positions.length > 0) {
         const snapshot = { ...data, id: Date.now(), uploadedAt: Date.now() };
         const updated = [...holdingSnapshots, snapshot];
@@ -588,11 +713,10 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
       {/* Upload area */}
       <Card>
         <SectionLabel>UPLOAD PORTFOLIO SNAPSHOT</SectionLabel>
-        <input type="file" accept="application/pdf" ref={fileInputRef} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleFile(e.target.files[0]); e.target.value = ""; }} />
+        <input type="file" accept="application/pdf,.csv,text/csv" ref={fileInputRef} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleFile(e.target.files[0]); e.target.value = ""; }} />
         <div className="pdf-drop" onClick={() => fileInputRef.current?.click()}
           onDragOver={e => e.preventDefault()}
-          onDrop={e => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}>
-          {uploading ? (
+          onDrop={e => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}>          {uploading ? (
             <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "8px 0" }}>
               <div style={{ width: 18, height: 18, border: `2px solid ${T.border}`, borderTopColor: T.blueMid, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
               <span style={{ fontSize: 12, color: T.textSub }}>Reading your portfolio statement…</span>
@@ -603,9 +727,14 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
             <div style={{ fontSize: 12, color: T.red }}>⚠ {uploadStatus}</div>
           ) : (
             <div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: T.text, marginBottom: 4 }}>📊 Upload E-Trade Statement PDF</div>
-              <div style={{ fontSize: 11, color: T.textMuted }}>Click or drag & drop — Claude AI extracts all positions, yields, and allocation data instantly</div>
-              <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}>Upload anytime — weekly after paycheck deploys, or whenever you add new positions</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: T.text, marginBottom: 4 }}>📊 Upload Portfolio — PDF or CSV</div>
+              <div style={{ fontSize: 11, color: T.textMuted }}>
+                <strong style={{ color: T.text }}>CSV (recommended):</strong> E-Trade → Accounts → Portfolio → Export — instant, free, no AI needed
+              </div>
+              <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}>
+                <strong style={{ color: T.text }}>PDF:</strong> Upload your monthly statement — Claude AI extracts all positions automatically
+              </div>
+              <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}>Upload anytime — weekly after paycheck deploys or whenever you add new positions</div>
             </div>
           )}
         </div>
