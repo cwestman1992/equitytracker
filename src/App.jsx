@@ -160,9 +160,13 @@ function fileToBase64(file) {
 
 async function extractStatementFromPdf(file) {
   const base64 = await fileToBase64(file);
+  const apiKey = import.meta.env?.VITE_ANTHROPIC_KEY || "";
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(apiKey ? { "x-api-key": apiKey, "anthropic-version": "2023-06-01" } : {}),
+    },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514", max_tokens: 1000,
       messages: [{ role: "user", content: [
@@ -192,9 +196,13 @@ If not found, use 0. Return only the JSON.` }
 
 async function extractHoldingsFromPdf(file) {
   const base64 = await fileToBase64(file);
+  const apiKey = import.meta.env?.VITE_ANTHROPIC_KEY || "";
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(apiKey ? { "x-api-key": apiKey, "anthropic-version": "2023-06-01" } : {}),
+    },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514", max_tokens: 4000,
       messages: [{ role: "user", content: [
