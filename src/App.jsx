@@ -520,7 +520,7 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
   const latest = holdingSnapshots.length ? holdingSnapshots[holdingSnapshots.length - 1] : null;
 
   const handleFile = async (file) => {
-    if (!file || file.type !== "application/pdf") { setUploadStatus("error"); return; }
+    if (!file || file.type !== "application/pdf") { setUploadStatus("error: not a PDF"); return; }
     setUploading(true); setUploadStatus(null);
     try {
       const data = await extractHoldingsFromPdf(file);
@@ -530,8 +530,8 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
         setHoldingSnapshots(updated);
         saveHoldings(updated);
         setUploadStatus("success");
-      } else { setUploadStatus("error"); }
-    } catch { setUploadStatus("error"); }
+      } else { setUploadStatus("error: no positions found in response"); }
+    } catch(err) { setUploadStatus("error: " + (err?.message || String(err))); }
     setUploading(false);
   };
 
@@ -600,7 +600,7 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
           ) : uploadStatus === "success" ? (
             <div style={{ fontSize: 12, color: T.green, fontWeight: 600 }}>✓ Portfolio snapshot saved — {latest?.positions?.length} positions extracted</div>
           ) : uploadStatus === "error" ? (
-            <div style={{ fontSize: 12, color: T.red }}>Couldn't extract holdings. Try a different PDF or check it's an E-Trade statement.</div>
+            <div style={{ fontSize: 12, color: T.red }}>⚠ {uploadStatus}</div>
           ) : (
             <div>
               <div style={{ fontSize: 13, fontWeight: 600, color: T.text, marginBottom: 4 }}>📊 Upload E-Trade Statement PDF</div>
