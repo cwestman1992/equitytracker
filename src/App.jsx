@@ -166,7 +166,7 @@ async function extractStatementFromPdf(file) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514", max_tokens: 1000,
+      model: "claude-sonnet-4-20250514", max_tokens: 1500,
       messages: [{ role: "user", content: [
         { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } },
         { type: "text", text: `Extract from this E-Trade brokerage statement. Return ONLY valid JSON, no markdown, no explanation.
@@ -191,9 +191,27 @@ If not found, use 0. Return only the JSON.` }
       ]}]
     })
   });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(`API error ${response.status}: ${err?.error || "unknown"}`);
+  }
+
   const data = await response.json();
-  const text = (data.content || []).map(b => b.text || "").join("");
-  return JSON.parse(text.replace(/```json|```/g, "").trim());
+
+  // Check for API-level errors in the response body
+  if (data.error) throw new Error(`API: ${data.error}`);
+  if (data.type === "error") throw new Error(`API: ${data.error?.message || data.type}`);
+
+  const text = (data.content || []).map(b => b.text || "").join("").trim();
+  if (!text) throw new Error("Empty response from API — try again in a moment");
+
+  const cleaned = text.replace(/```json|```/g, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    throw new Error(`Could not parse response: ${cleaned.slice(0, 80)}`);
+  }
 }
 
 async function extractHoldingsFromPdf(file) {
@@ -240,9 +258,26 @@ Include EVERY position listed under Stocks, ETFs & Closed-End Funds sections. Fo
       ]}]
     })
   });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(`API error ${response.status}: ${err?.error || "unknown"}`);
+  }
+
   const data = await response.json();
-  const text = (data.content || []).map(b => b.text || "").join("");
-  const result = JSON.parse(text.replace(/```json|```/g, "").trim());
+  if (data.error) throw new Error(`API: ${data.error}`);
+  if (data.type === "error") throw new Error(`API: ${data.error?.message || data.type}`);
+
+  const text = (data.content || []).map(b => b.text || "").join("").trim();
+  if (!text) throw new Error("Empty response from API — try again in a moment");
+
+  const cleaned = text.replace(/```json|```/g, "").trim();
+  let result;
+  try {
+    result = JSON.parse(cleaned);
+  } catch {
+    throw new Error(`Could not parse response: ${cleaned.slice(0, 80)}`);
+  }
   if (result.positions) {
     result.positions = result.positions.map(p => ({ ...p, bucket: p.bucket || assignBucket(p.ticker) }));
   }
@@ -1390,29 +1425,89 @@ export default function App() {
     const effectiveInterest=actualInterest!==null?actualInterest:estimatedInterest;
     const actualYield=actualDivs!==null?(actualDivs*12)/e.gross:effectiveYield;
     const equityMomentum=prevEquity!==null?equity-prevEquity:null;
-    // True net draw includes interest
     const trueNetDraw=Math.max(0,e.bills+effectiveInterest-effectiveDivs);
     return {...e,equity,prevEquity,rising,estimatedDivs,actualDivs,effectiveDivs,divGrowth,coverage,netDraw,estimatedInterest,actualInterest,effectiveInterest,actualYield,equityMomentum,trueNetDraw};
   }), [entries, effectiveYield, settings.marginRate]);
 
   const latest=computed[computed.length-1];
+
+  // ── CURRENT SNAPSHOT ──────────────────────────────────────────────────────────
+  // For all forward-looking calculations (projections, stress test, bill modeler),
+  // we want the MOST CURRENT portfolio values. If a holdings snapshot exists, it's
+  // fresher than the monthly log. W2 and bills always come from the log since they
+  // aren't in the holdings data.
+  const currentSnapshot = useMemo(() => {
+    if (!latest && !latestHoldings) return null;
+
+    // If holdings snapshot exists and has real data, use it for portfolio values
+    if (latestHoldings && (latestHoldings.totalAssets || 0) > 0) {
+      const g = latestHoldings.totalAssets || 0;
+      const m = latestHoldings.marginLoan || 0;
+      const equity = g > 0 ? (g - m) / g : 0;
+      // Use holdings EAI for divs if available, otherwise estimate from yield
+      const monthlyEAI = latestHoldings.totalEstAnnIncome
+        ? latestHoldings.totalEstAnnIncome / 12
+        : g * effectiveYield / 12;
+      const w2 = latest?.w2 || 0;
+      const bills = latest?.bills || 0;
+      const estimatedInterest = m * settings.marginRate / 12;
+      const coverage = bills > 0 ? monthlyEAI / bills : 0;
+      const trueNetDraw = Math.max(0, bills + estimatedInterest - monthlyEAI);
+      return {
+        gross: g, margin: m, equity,
+        effectiveDivs: monthlyEAI,
+        estimatedDivs: g * effectiveYield / 12,
+        actualDivs: null,
+        effectiveInterest: estimatedInterest,
+        estimatedInterest, actualInterest: null,
+        w2, bills, coverage, netDraw: Math.max(0, bills - monthlyEAI),
+        trueNetDraw,
+        date: latest?.date || new Date().toISOString().slice(0, 7),
+        equityMomentum: latest?.equityMomentum || null,
+        actualYield: latestHoldings.totalEstAnnIncome && g > 0
+          ? latestHoldings.totalEstAnnIncome / g : effectiveYield,
+        fromHoldings: true,
+        holdingsDate: latestHoldings.uploadedAt,
+      };
+    }
+    // Fall back to log data
+    return latest ? { ...latest, fromHoldings: false } : null;
+  }, [latest, latestHoldings, effectiveYield, settings.marginRate]);
   const nextBillAmt=parseNum(nextBill)||200;
   let risingStreak=0; for(let i=computed.length-1;i>=1;i--){if(computed[i].rising)risingStreak++;else break;}
-  const cond1=latest?latest.equity>=0.60:false;
+  // Conditions: cond1 uses currentSnapshot equity (most current), cond2 uses log streak, cond3 uses currentSnapshot for projections
+  const cond1=currentSnapshot?currentSnapshot.equity>=0.60:false;
   const cond2=risingStreak>=2;
-  const cond3=latest?projectMinEquity(latest.gross,latest.margin,latest.effectiveDivs,latest.w2+nextBillAmt,latest.bills+nextBillAmt,settings.marginRate,effectiveYield,3)>=0.55:false;
+  const cond3=currentSnapshot?projectMinEquity(currentSnapshot.gross,currentSnapshot.margin,currentSnapshot.effectiveDivs,currentSnapshot.w2+nextBillAmt,currentSnapshot.bills+nextBillAmt,settings.marginRate,effectiveYield,3)>=0.55:false;
   const allGreen=cond1&&cond2&&cond3;
-  const freedomMonths=latest?projectFreedomMonths(latest.gross,latest.margin,latest.effectiveDivs,latest.w2,latest.bills,settings.marginRate,effectiveYield):null;
+  // Freedom date and projections always use currentSnapshot
+  const freedomMonths=currentSnapshot?projectFreedomMonths(currentSnapshot.gross,currentSnapshot.margin,currentSnapshot.effectiveDivs,currentSnapshot.w2,currentSnapshot.bills,settings.marginRate,effectiveYield):null;
   const freedomDate=getFreedomDate(freedomMonths);
   const daysUntilLog=getDaysUntilNextLog(entries);
   const totalDivsReceived=computed.reduce((s,e)=>s+e.effectiveDivs,0);
   const recentMom=computed.slice(-3).map(e=>e.equityMomentum).filter(v=>v!==null);
   const equityMomAvg=recentMom.length?recentMom.reduce((a,b)=>a+b,0)/recentMom.length:null;
-  const monthsToTrigger=equityMomAvg>0&&latest&&!cond1?Math.ceil((0.60-latest.equity)/equityMomAvg):null;
+  const monthsToTrigger=equityMomAvg>0&&currentSnapshot&&!cond1?Math.ceil((0.60-currentSnapshot.equity)/equityMomAvg):null;
   const eqColor=(eq)=>eq>=0.60?T.green:eq>=0.55?T.amber:T.red;
 
   const openAdd=()=>{setEditIdx(null);setForm({gross:"",margin:"",w2:"",bills:"",actualDivs:"",actualInterest:"",date:new Date().toISOString().slice(0,7)});setPdfStatus(null);setSaveError(null);setShowAdd(true);};
   const openEdit=(idx)=>{const e=entries[idx];setEditIdx(idx);setForm({gross:String(e.gross),margin:String(e.margin),w2:String(e.w2),bills:String(e.bills),actualDivs:e.actualDivs!=null?String(e.actualDivs):"",actualInterest:e.actualInterest!=null?String(e.actualInterest):"",date:e.date});setPdfStatus(null);setSaveError(null);setShowAdd(true);};
+  // Pre-fill log modal from latest holdings snapshot
+  const openLogFromHoldings=()=>{
+    if(!latestHoldings)return;
+    setEditIdx(null);
+    setForm({
+      gross:String(latestHoldings.totalAssets||""),
+      margin:String(latestHoldings.marginLoan||0),
+      w2:latest?String(latest.w2):"",
+      bills:latest?String(latest.bills):"",
+      actualDivs:"",actualInterest:"",
+      date:new Date().toISOString().slice(0,7),
+    });
+    setPdfStatus("success");
+    setSaveError(null);
+    setShowAdd(true);
+  };
 
   const handleSave=async()=>{
     setSaveError(null);
@@ -1505,8 +1600,9 @@ export default function App() {
           <div style={{display:"flex",gap:10,alignItems:"center"}}>
             {daysUntilLog!==null&&(<div style={{padding:"5px 14px",borderRadius:20,fontSize:11,fontWeight:600,background:daysUntilLog<=3?T.redBg:daysUntilLog<=7?T.amberBg:T.surfaceAlt,color:daysUntilLog<=3?T.red:daysUntilLog<=7?T.amber:T.textMuted,border:`1px solid ${daysUntilLog<=3?T.redBorder:daysUntilLog<=7?T.amberBorder:T.border}`}}>{daysUntilLog>0?`Log in ${daysUntilLog}d`:daysUntilLog===0?"Log due today":"Log overdue"}</div>)}
             {floatedBillsTotal>0&&<div style={{padding:"5px 14px",borderRadius:20,fontSize:11,fontWeight:600,background:T.greenBg,color:T.green,border:`1px solid ${T.greenBorder}`}}>{fmt$(floatedBillsTotal,0)}/mo routing</div>}
-            {latestHoldings&&<div style={{padding:"5px 14px",borderRadius:20,fontSize:11,fontWeight:600,background:T.indigoBg,color:T.indigo,border:`1px solid ${T.indigoBorder}`}}>Holdings: {fmtTS(latestHoldings.uploadedAt).split(",")[0]}</div>}
+            {currentSnapshot?.fromHoldings&&<div style={{padding:"5px 14px",borderRadius:20,fontSize:11,fontWeight:600,background:T.indigoBg,color:T.indigo,border:`1px solid ${T.indigoBorder}`}}>📊 Live from holdings · {fmtTS(currentSnapshot.holdingsDate).split(",")[0]}</div>}
             <button onClick={()=>setShowQC(true)} style={{padding:"8px 16px",background:T.blueBg,color:T.blue,border:`1px solid ${T.blueBorder}`,borderRadius:8,fontSize:12,fontWeight:700,fontFamily:"inherit"}}>Quick Check</button>
+            {latestHoldings&&<button onClick={openLogFromHoldings} style={{padding:"8px 16px",background:T.indigoBg,color:T.indigo,border:`1px solid ${T.indigoBorder}`,borderRadius:8,fontSize:12,fontWeight:700,fontFamily:"inherit"}}>📊 Log from Holdings</button>}
             <button onClick={openAdd} style={{padding:"8px 20px",background:T.text,color:"#fff",border:"none",borderRadius:8,fontSize:12,fontWeight:700,fontFamily:"inherit"}}>+ Log Month</button>
           </div>
         </div>
@@ -1531,7 +1627,14 @@ export default function App() {
         {activeTab==="dashboard"&&(
           <div style={{display:"grid",gridTemplateColumns:"1fr 340px",gap:24}}>
             <div style={{display:"flex",flexDirection:"column",gap:20}}>
-              {computed.length>=2&&(allGreen?(
+              {/* Data source notice when using holdings */}
+              {currentSnapshot?.fromHoldings&&(
+                <div style={{background:T.indigoBg,border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusSm,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <div style={{fontSize:11,color:T.indigo,fontWeight:600}}>📊 Projections using live holdings data ({fmtTS(currentSnapshot.holdingsDate).split(",")[0]}) — more accurate than last log entry</div>
+                  <button onClick={openLogFromHoldings} style={{fontSize:11,fontWeight:700,color:T.indigo,background:"none",border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusXs,padding:"4px 10px",fontFamily:"inherit",cursor:"pointer"}}>Log This →</button>
+                </div>
+              )}
+              {(currentSnapshot||computed.length>=2)&&(allGreen?(
                 <div className="trigger-glow" style={{background:T.greenBg,border:`1.5px solid ${T.greenBorder}`,borderRadius:T.radius,padding:"20px 28px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <div><div style={{fontSize:20,fontWeight:800,color:T.green,fontFamily:"'Lora', serif"}}>Add your next bill now</div><div style={{fontSize:12,color:T.textSub,marginTop:4}}>All 3 conditions met — redirect +${nextBillAmt.toLocaleString()}/mo immediately</div></div>
                   <div style={{fontSize:36}}>🟢</div>
@@ -1542,16 +1645,21 @@ export default function App() {
                   <div style={{fontSize:20,fontWeight:800,color:T.amber,fontFamily:"'Lora', serif"}}>{[cond1,cond2,cond3].filter(Boolean).length}/3</div>
                 </div>
               ))}
-              {latest&&(
+              {currentSnapshot&&(
                 <Card style={{background:T.text}}>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:24}}>
-                    {[{l:"FREEDOM DATE",v:freedomDate||"—",sub:freedomMonths?`${freedomMonths} months away`:""},{l:"NET DRAW (w/ interest)",v:fmt$(latest.trueNetDraw),sub:"bills + interest − dividends",c:latest.trueNetDraw>0?"#FCA5A5":"#6EE7B7"},{l:"ANNUAL RUN RATE",v:fmt$(latest.effectiveDivs*12),sub:latest.actualDivs!==null?"from actual data":"estimated",c:"#6EE7B7"},{l:"ALL-TIME DIVS",v:fmt$(totalDivsReceived),sub:`${entries.length} months`,c:"#fff"}].map(({l,v,sub,c})=>(
+                    {[
+                      {l:"FREEDOM DATE",v:freedomDate||"—",sub:freedomMonths?`${freedomMonths} months away`:""},
+                      {l:"NET DRAW (w/ interest)",v:fmt$(currentSnapshot.trueNetDraw),sub:"bills + interest − dividends",c:currentSnapshot.trueNetDraw>0?"#FCA5A5":"#6EE7B7"},
+                      {l:"ANNUAL RUN RATE",v:fmt$(currentSnapshot.effectiveDivs*12),sub:currentSnapshot.fromHoldings?"from holdings EAI":"estimated",c:"#6EE7B7"},
+                      {l:"ALL-TIME DIVS",v:fmt$(totalDivsReceived),sub:`${entries.length} months logged`,c:"#fff"},
+                    ].map(({l,v,sub,c})=>(
                       <div key={l}><div style={{fontSize:10,fontWeight:700,letterSpacing:"1.2px",color:"rgba(255,255,255,0.45)",marginBottom:8}}>{l}</div><div style={{fontSize:18,fontWeight:700,color:c||"#fff",fontFamily:"'Lora', serif",lineHeight:1.2}}>{v}</div><div style={{fontSize:11,color:"rgba(255,255,255,0.4)",marginTop:4}}>{sub}</div></div>
                     ))}
                   </div>
                   <div style={{marginTop:20,paddingTop:16,borderTop:"1px solid rgba(255,255,255,0.1)"}}>
-                    <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:11,color:"rgba(255,255,255,0.4)"}}>0%</span><span style={{fontSize:11,color:"#6EE7B7",fontWeight:600}}>{fmtPct(latest.coverage,1)} of bills covered by dividends</span><span style={{fontSize:11,color:"rgba(255,255,255,0.4)"}}>100% = freedom</span></div>
-                    <div style={{height:6,background:"rgba(255,255,255,0.1)",borderRadius:3,overflow:"hidden"}}><div style={{height:"100%",width:`${Math.min(100,latest.coverage*100)}%`,background:"linear-gradient(90deg, #6EE7B7, #34D399)",borderRadius:3,transition:"width 0.5s"}}/></div>
+                    <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:11,color:"rgba(255,255,255,0.4)"}}>0%</span><span style={{fontSize:11,color:"#6EE7B7",fontWeight:600}}>{fmtPct(currentSnapshot.coverage,1)} of bills covered by dividends</span><span style={{fontSize:11,color:"rgba(255,255,255,0.4)"}}>100% = freedom</span></div>
+                    <div style={{height:6,background:"rgba(255,255,255,0.1)",borderRadius:3,overflow:"hidden"}}><div style={{height:"100%",width:`${Math.min(100,currentSnapshot.coverage*100)}%`,background:"linear-gradient(90deg, #6EE7B7, #34D399)",borderRadius:3,transition:"width 0.5s"}}/></div>
                   </div>
                 </Card>
               )}
@@ -1573,7 +1681,11 @@ export default function App() {
               <Card>
                 <SectionLabel>BILL ADDITION CONDITIONS</SectionLabel>
                 <div style={{marginBottom:14,display:"flex",alignItems:"center",gap:8,fontSize:12,color:T.textSub}}>Next bill:<input value={nextBill} onChange={e=>setNextBill(e.target.value)} style={{width:76,padding:"6px 10px",background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,fontWeight:700,color:T.text,fontFamily:"inherit",outline:"none",textAlign:"right"}}/><span>/mo</span></div>
-                {[{pass:cond1,hd:computed.length>0,label:"Equity ≥ 60%",sub:latest?`Currently ${fmtPct(latest.equity)}`:"No data yet"},{pass:cond2,hd:computed.length>1,label:"Rising 2+ months",sub:risingStreak>=2?"Confirmed uptrend ✓":`${risingStreak} of 2 consecutive months`,badge:risingStreak>0?`↑ ${risingStreak}mo`:null},{pass:cond3,hd:computed.length>0,label:"3-month floor ≥ 55%",sub:latest?`Projected min: ${fmtPct(projectMinEquity(latest.gross,latest.margin,latest.effectiveDivs,latest.w2+nextBillAmt,latest.bills+nextBillAmt,settings.marginRate,effectiveYield,3))}`:"No data yet"}].map(({pass,hd,label,sub,badge})=>(
+                {[
+                  {pass:cond1,hd:!!currentSnapshot,label:"Equity ≥ 60%",sub:currentSnapshot?`Currently ${fmtPct(currentSnapshot.equity)}`:"No data yet"},
+                  {pass:cond2,hd:computed.length>1,label:"Rising 2+ months",sub:risingStreak>=2?"Confirmed uptrend ✓":`${risingStreak} of 2 consecutive months`,badge:risingStreak>0?`↑ ${risingStreak}mo`:null},
+                  {pass:cond3,hd:!!currentSnapshot,label:"3-month floor ≥ 55%",sub:currentSnapshot?`Projected min: ${fmtPct(projectMinEquity(currentSnapshot.gross,currentSnapshot.margin,currentSnapshot.effectiveDivs,currentSnapshot.w2+nextBillAmt,currentSnapshot.bills+nextBillAmt,settings.marginRate,effectiveYield,3))}`:"No data yet"},
+                ].map(({pass,hd,label,sub,badge})=>(
                   <div key={label} style={{display:"flex",gap:12,padding:"12px 14px",borderRadius:T.radiusSm,marginBottom:8,background:!hd?T.surfaceAlt:pass?T.greenBg:T.redBg,border:`1px solid ${!hd?T.border:pass?T.greenBorder:T.redBorder}`}}>
                     <div style={{width:10,height:10,borderRadius:"50%",background:!hd?T.textMuted:pass?T.greenMid:T.red,marginTop:4,flexShrink:0,boxShadow:pass?`0 0 8px ${T.greenMid}55`:"none"}}/>
                     <div style={{flex:1}}><div style={{fontSize:12,fontWeight:700,color:T.text,display:"flex",alignItems:"center",gap:8}}>{label}{badge&&<span style={{fontSize:10,fontWeight:700,padding:"1px 8px",borderRadius:20,background:T.amberBg,color:T.amber,border:`1px solid ${T.amberBorder}`}}>{badge}</span>}</div><div style={{fontSize:11,color:T.textSub,marginTop:2}}>{sub}</div></div>
@@ -1581,11 +1693,23 @@ export default function App() {
                 ))}
                 {monthsToTrigger!==null&&monthsToTrigger>0&&!cond1&&(<div style={{padding:"10px 14px",background:T.blueBg,border:`1px solid ${T.blueBorder}`,borderRadius:T.radiusSm,fontSize:11,color:T.blue,fontWeight:600}}>📈 At current pace — trigger in ~{monthsToTrigger} month{monthsToTrigger!==1?"s":""}</div>)}
               </Card>
-              {latest&&(
+              {currentSnapshot&&(
                 <Card>
-                  <SectionLabel>LATEST SNAPSHOT</SectionLabel>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+                    <div style={{fontSize:11,fontWeight:700,letterSpacing:"1.5px",color:T.textMuted}}>CURRENT SNAPSHOT</div>
+                    {currentSnapshot.fromHoldings?<span style={{fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:20,background:T.indigoBg,color:T.indigo,border:`1px solid ${T.indigoBorder}`}}>FROM HOLDINGS</span>:<span style={{fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:20,background:T.amberBg,color:T.amber,border:`1px solid ${T.amberBorder}`}}>FROM LOG</span>}
+                  </div>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-                    {[{l:"GROSS",v:fmt$(latest.gross),c:T.text},{l:"NET VALUE",v:fmt$(latest.gross-latest.margin),c:T.text},{l:"MARGIN DEBT",v:fmt$(latest.margin),c:T.red},{l:"EQUITY",v:fmtPct(latest.equity),c:eqColor(latest.equity)},{l:"DIVS / MO",v:fmt$(latest.effectiveDivs),c:T.green,badge:latest.actualDivs!==null?"ACTUAL":"EST"},{l:"COVERAGE",v:fmtPct(latest.coverage,1),c:latest.coverage>=1?T.green:T.amber},{l:"INTEREST / MO",v:fmt$(latest.effectiveInterest),c:T.red,badge:latest.actualInterest!==null?"ACTUAL":"EST"},{l:"NET DRAW",v:fmt$(latest.trueNetDraw),c:latest.trueNetDraw>0?T.red:T.green}].map(({l,v,c,badge})=><StatTile key={l} label={l} value={v} color={c} size={14} badge={badge} serif/>)}
+                    {[
+                      {l:"GROSS",v:fmt$(currentSnapshot.gross),c:T.text},
+                      {l:"NET VALUE",v:fmt$(currentSnapshot.gross-currentSnapshot.margin),c:T.text},
+                      {l:"MARGIN DEBT",v:fmt$(currentSnapshot.margin),c:T.red},
+                      {l:"EQUITY",v:fmtPct(currentSnapshot.equity),c:eqColor(currentSnapshot.equity)},
+                      {l:"DIVS / MO",v:fmt$(currentSnapshot.effectiveDivs),c:T.green,badge:currentSnapshot.fromHoldings?"HOLDINGS":"EST"},
+                      {l:"COVERAGE",v:fmtPct(currentSnapshot.coverage,1),c:currentSnapshot.coverage>=1?T.green:T.amber},
+                      {l:"INTEREST / MO",v:fmt$(currentSnapshot.effectiveInterest),c:T.red,badge:"EST"},
+                      {l:"NET DRAW",v:fmt$(currentSnapshot.trueNetDraw),c:currentSnapshot.trueNetDraw>0?T.red:T.green},
+                    ].map(({l,v,c,badge})=><StatTile key={l} label={l} value={v} color={c} size={14} badge={badge} serif/>)}
                   </div>
                 </Card>
               )}
@@ -1604,11 +1728,11 @@ export default function App() {
           </div>
         )}
 
-        {activeTab==="modeler"&&<BillModelerTab latest={latest} settings={fullSettings}/>}
-        {activeTab==="bills"&&<BillTrackerTab billItems={billItems} setBillItems={setBillItems} saveBills={saveBills} latest={latest} settings={fullSettings}/>}
+        {activeTab==="modeler"&&<BillModelerTab latest={currentSnapshot} settings={fullSettings}/>}
+        {activeTab==="bills"&&<BillTrackerTab billItems={billItems} setBillItems={setBillItems} saveBills={saveBills} latest={currentSnapshot} settings={fullSettings}/>}
         {activeTab==="holdings"&&<HoldingsTab holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots} saveHoldings={saveHoldings}/>}
         {activeTab==="dividends"&&<DividendsTab computed={computed}/>}
-        {activeTab==="stress"&&<StressTestTab latest={latest} settings={fullSettings}/>}
+        {activeTab==="stress"&&<StressTestTab latest={currentSnapshot} settings={fullSettings}/>}
 
         {activeTab==="metrics"&&(
           <div>{!latest?<Card><div style={{textAlign:"center",padding:48,color:T.textMuted}}>Log your first month to see metrics.</div></Card>:(
