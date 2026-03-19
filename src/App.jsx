@@ -241,107 +241,108 @@ Include EVERY position listed under Stocks, ETFs & Closed-End Funds sections. Fo
 
 // ── E-TRADE CSV PARSER ────────────────────────────────────────────────────────
 function parseETradeCSV(text) {
-  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  const lines = text.split(/\r?\n/).map(l => l.trim());
 
-  // Find the header row — E-Trade CSVs often have account info at top
-  let headerIdx = lines.findIndex(l =>
-    /symbol|ticker/i.test(l) && /quantity|qty/i.test(l)
+  // Find the holdings header row — look for Symbol + Value $
+  const headerIdx = lines.findIndex(l =>
+    l.includes("Symbol") && l.includes("Value") && l.includes("Qty")
   );
-  if (headerIdx === -1) throw new Error("Could not find header row with Symbol and Quantity columns");
+  if (headerIdx === -1) throw new Error("Could not find holdings header row");
 
-  const headers = lines[headerIdx].split(",").map(h => h.trim().replace(/^"|"$/g, "").toLowerCase());
-
-  // Column index helpers
-  const col = (names) => {
-    for (const n of names) {
-      const idx = headers.findIndex(h => h.includes(n));
-      if (idx !== -1) return idx;
+  // Parse comma-separated, handling quoted fields
+  const parseRow = (line) => {
+    const cols = []; let cur = ""; let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (c === '"') { inQ = !inQ; }
+      else if (c === ',' && !inQ) { cols.push(cur.trim()); cur = ""; }
+      else { cur += c; }
     }
-    return -1;
+    cols.push(cur.trim());
+    return cols;
   };
 
-  const iSymbol    = col(["symbol", "ticker"]);
-  const iName      = col(["description", "name", "security"]);
-  const iQty       = col(["quantity", "qty", "shares"]);
-  const iPrice     = col(["last price", "price", "last"]);
-  const iMV        = col(["current value", "market value", "value"]);
-  const iCost      = col(["cost basis", "total cost", "cost"]);
-  const iGL        = col(["gain/loss $", "gain/loss dollar", "unrealized gain", "gain $", "gain loss"]);
-  const iEAI       = col(["est. annual income", "annual income", "est annual"]);
-  const iYield     = col(["current yield", "yield %", "yield"]);
-  const iAsset     = col(["asset class", "type", "asset type", "category"]);
+  const headers = parseRow(lines[headerIdx]);
+  const h = (name) => headers.findIndex(c => c.toLowerCase().includes(name.toLowerCase()));
+
+  // Map exact E-Trade column names
+  const iSymbol  = h("Symbol");
+  const iPrice   = h("Last Price");
+  const iPaid    = h("Price Paid");
+  const iQty     = h("Qty");
+  const iCostSh  = h("Cost/Share");
+  const iGL      = h("Total Gain $");
+  const iValue   = h("Value $");
+  const iYield   = h("Dividend Yield");
+  const iPct     = h("% of Portfolio");
+  const iEAI     = h("Est. Annual Income");
 
   const parseV = (v) => {
-    if (!v) return 0;
-    const s = String(v).replace(/^"|"$/g, "").replace(/[$,%]/g, "").replace(/\(([^)]+)\)/, "-$1").trim();
-    return parseFloat(s) || 0;
+    if (!v || v === "--" || v === "") return 0;
+    return parseFloat(String(v).replace(/[$,%]/g, "").replace(/\(([^)]+)\)/, "-$1").trim()) || 0;
   };
 
   const positions = [];
-  let totalMV = 0, totalCost = 0, totalGL = 0, totalEAI = 0;
+  let totalMV = 0, totalGL = 0, totalEAI = 0;
 
   for (let i = headerIdx + 1; i < lines.length; i++) {
-    const row = lines[i].split(",").map(c => c.trim().replace(/^"|"$/g, ""));
-    if (!row[iSymbol] || row[iSymbol].toLowerCase() === "symbol") continue;
+    const line = lines[i];
+    if (!line) continue;
+    const row = parseRow(line);
+    const sym = row[iSymbol]?.trim();
 
-    // Skip totals/summary rows
-    const sym = row[iSymbol].trim();
-    if (!sym || sym.toLowerCase().includes("total") || sym.toLowerCase().includes("account")) continue;
-    // Skip cash/margin rows
-    if (sym.toLowerCase().includes("cash") || sym === "--" || sym === "") continue;
+    // Skip empty, TOTAL, CASH, and blank symbol rows
+    if (!sym || sym === "TOTAL" || sym === "CASH" || sym.toLowerCase().includes("total")) continue;
 
-    const mv    = parseV(row[iMV]);
-    const cost  = parseV(row[iCost]);
-    const gl    = parseV(row[iGL]);
-    const eai   = iEAI !== -1 ? parseV(row[iEAI]) : 0;
-    const yld   = iYield !== -1 ? parseV(row[iYield]) : (mv > 0 && eai > 0 ? (eai / mv) * 100 : 0);
-    const price = parseV(row[iPrice]);
     const qty   = parseV(row[iQty]);
+    const price = parseV(row[iPrice]);
+    const paid  = parseV(row[iPaid] !== undefined ? row[iPaid] : row[iCostSh]);
+    const costSh= parseV(row[iCostSh] !== undefined ? row[iCostSh] : row[iPaid]);
+    const mv    = parseV(row[iValue]);
+    const gl    = parseV(row[iGL]);
+    const yld   = parseV(row[iYield]);
+    const eai   = parseV(row[iEAI]);
 
-    if (!mv && !qty) continue; // skip empty rows
+    // Cost basis = cost per share × quantity
+    const cost  = costSh * qty;
 
-    // Guess asset class from symbol/name if not provided
-    let assetClass = "Equities";
-    if (iAsset !== -1 && row[iAsset]) {
-      const ac = row[iAsset].toLowerCase();
-      if (ac.includes("alt") || ac.includes("etf")) assetClass = "Alternatives";
-      else if (ac.includes("fixed") || ac.includes("bond") || ac.includes("pref")) assetClass = "Fixed Income & Pref";
-      else if (ac.includes("cash")) assetClass = "Cash";
-      else assetClass = "Equities";
-    }
+    if (!mv && !qty) continue;
 
     positions.push({
       ticker: sym,
-      name: iName !== -1 ? row[iName] : sym,
+      name: sym,
       quantity: qty,
       sharePrice: price,
       totalCost: cost,
       marketValue: mv,
-      unrealizedGL: gl || (mv - cost),
+      unrealizedGL: gl,
       estAnnIncome: eai,
       currentYield: yld,
-      assetClass,
+      assetClass: "Equities", // E-Trade CSV doesn't include asset class
     });
 
-    totalMV   += mv;
-    totalCost += cost;
-    totalGL   += (gl || (mv - cost));
-    totalEAI  += eai;
+    totalMV  += mv;
+    totalGL  += gl;
+    totalEAI += eai;
   }
 
-  if (!positions.length) throw new Error("No positions found — check the CSV format");
+  if (!positions.length) throw new Error("No positions found — check the CSV is an E-Trade portfolio export");
+
+  // Cash balance from CASH row if present
+  const cashLine = lines.find(l => parseRow(l)[iSymbol]?.trim() === "CASH");
+  const cashMV = cashLine ? parseV(parseRow(cashLine)[iValue]) : 0;
 
   return {
     date: new Date().toISOString().slice(0, 7),
     positions,
-    totalAssets: totalMV,
+    totalAssets: totalMV + cashMV,
     marginLoan: 0,
-    netValue: totalMV,
+    netValue: totalMV + cashMV,
     allocation: {
-      equities:    positions.filter(p => p.assetClass === "Equities").reduce((s, p) => s + p.marketValue, 0),
-      fixedIncome: positions.filter(p => p.assetClass === "Fixed Income & Pref").reduce((s, p) => s + p.marketValue, 0),
-      alternatives:positions.filter(p => p.assetClass === "Alternatives").reduce((s, p) => s + p.marketValue, 0),
-      cash: 0,
+      equities:     totalMV,
+      fixedIncome:  0,
+      alternatives: 0,
+      cash:         cashMV,
     },
     totalEstAnnIncome: totalEAI,
     totalUnrealizedGL: totalGL,
