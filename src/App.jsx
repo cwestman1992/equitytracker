@@ -170,17 +170,21 @@ async function extractStatementFromPdf(file) {
         { type: "text", text: `Extract from this E-Trade brokerage statement. Return ONLY valid JSON, no markdown, no explanation.
 
 {
-  "gross": <Total Assets number, e.g. 5419.12>,
+  "gross": <Total Assets number from Balance Sheet, e.g. 5419.12>,
   "margin": <absolute value of margin loan/debit as positive number, 0 if none, e.g. 1654.71>,
-  "dividends": <Total Income and Distributions for the period as a number, 0 if not found, e.g. 77.34>,
-  "interest": <Total Interest Charged for the period as a positive number, 0 if none, e.g. 15.25>,
+  "dividends": <Total Income and Distributions for the period, 0 if not found, e.g. 77.34>,
+  "interest": <Total Interest on Margin Loan as positive number, 0 if none, e.g. 15.25>,
+  "electronicCredits": <Electronic Transfers-Credits total for the period, 0 if not found, e.g. 436.05>,
+  "automatedPayments": <Total Automated Payments as positive number, 0 if not found, e.g. 237.53>,
   "date": <statement period month as YYYY-MM, e.g. "2026-02">
 }
 
 For gross: look for "Total Assets" in the Balance Sheet section.
-For margin: look for "Cash, BDP, MMFs (Debit)" or "Margin Loan" — use the absolute value.
-For dividends: look for "Total Income and Distributions" or "Income And Distributions" for the period.
-For interest: look for "Total Interest on Margin Loan" or "Interest Charged" total.
+For margin: look for "Cash, BDP, MMFs (Debit)" or "Margin Loan" — use absolute value.
+For dividends: look for "Total Income and Distributions" for This Period column.
+For interest: look for "Total Interest on Margin Loan" in the Margin Loan Interest Schedule.
+For electronicCredits: look for "Electronic Transfers-Credits" in the Cash Flow section — This Period column.
+For automatedPayments: look for "Automated Payments" in Cash Flow or "Total Automated Payments" in Debit Card section — use absolute value.
 If not found, use 0. Return only the JSON.` }
       ]}]
     })
@@ -1181,7 +1185,7 @@ function HelpPage() {
           <SectionLabel>HOW TO USE THIS TRACKER</SectionLabel>
           <Note icon="📅" color={T.amber} bg={T.amberBg} border={T.amberBorder}>Log once per month on the <strong>1st of each month</strong>.</Note>
           <Step n={1}><strong>Option A — PDF Upload:</strong> Click "+ Log Month" → upload your E-Trade statement PDF → Claude AI auto-fills Gross, Margin, Dividends, Interest, and Month.</Step>
-          <Step n={2}><strong>Option B — Manual:</strong> Enter Gross Portfolio (Total Assets), Margin Balance, W2 Deposit, Bills Floated, Actual Dividends, and Actual Interest from your statement.</Step>
+          <Step n={2}><strong>Option B — Manual:</strong> Enter Gross Portfolio (Total Assets), Margin Balance, Monthly Deposits, Bills Floated, Actual Dividends, and Actual Interest from your statement.</Step>
           <Step n={3}>Separately, upload to the <strong>Holdings tab</strong> anytime you want to snapshot your positions — after each paycheck deploy, or when you add new positions. This gives you position-level yield data and asset allocation tracking.</Step>
           <Step n={4}>When all 3 green conditions fire — act the same day. Toggle the bill in Bill Tracker, update your deposit.</Step>
           <Note icon="✏️" color={T.blue} bg={T.blueBg} border={T.blueBorder}>Made a mistake? Use the <strong>Edit</strong> button on any History entry to correct it.</Note>
@@ -1209,7 +1213,7 @@ function HelpPage() {
           <SectionLabel>KEY NUMBERS</SectionLabel>
           {[{l:"Trigger equity",v:"60%",c:T.green},{l:"Hard floor",v:"55%",c:T.amber},{l:"Rising streak",v:"2 months",c:T.text},{l:"Forward check",v:"3 months",c:T.blue},{l:"Target yield",v:"23%",c:T.green},{l:"Negotiated rate",v:"8.44%",c:T.red},{l:"E-Trade maintenance",v:"25%",c:T.rose}].map(({l,v,c})=>(<div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:`1px solid ${T.borderLight}`}}><span style={{fontSize:12,color:T.text}}>{l}</span><span style={{fontSize:15,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</span></div>))}
           <div style={{marginTop:16}}><SectionLabel>WHERE TO FIND YOUR NUMBERS</SectionLabel>
-            {[{l:"Gross (Total Assets)",w:"Balance Sheet → Total Assets"},{l:"Margin Loan",w:"Balance Sheet → Cash, BDP, MMFs (Debit)"},{l:"Actual Dividends",w:"Income and Distribution Summary → Total Income"},{l:"Actual Interest",w:"Margin Loan Interest Schedule → Total Interest"},{l:"Your Margin Rate",w:"Margin Loan Interest Schedule → Interest Rate %"}].map(({l,w})=>(<div key={l} style={{padding:"9px 12px",background:T.surfaceAlt,borderRadius:T.radiusXs,marginBottom:6}}><div style={{fontSize:11,fontWeight:600,color:T.text}}>{l}</div><div style={{fontSize:11,color:T.textMuted,marginTop:2}}>→ {w}</div></div>))}
+            {[{l:"Gross (Total Assets)",w:"Balance Sheet → Total Assets"},{l:"Margin Loan",w:"Balance Sheet → Cash, BDP, MMFs (Debit)"},{l:"Monthly Deposits",w:"Cash Flow → Electronic Transfers-Credits (This Period)"},{l:"Bills Floated",w:"Debit Card & Checking Activity → Total Automated Payments"},{l:"Actual Dividends",w:"Income and Distribution Summary → Total Income"},{l:"Actual Interest",w:"Margin Loan Interest Schedule → Total Interest"},{l:"Your Margin Rate",w:"Margin Loan Interest Schedule → Interest Rate %"}].map(({l,w})=>(<div key={l} style={{padding:"9px 12px",background:T.surfaceAlt,borderRadius:T.radiusXs,marginBottom:6}}><div style={{fontSize:11,fontWeight:600,color:T.text}}>{l}</div><div style={{fontSize:11,color:T.textMuted,marginTop:2}}>→ {w}</div></div>))}
           </div>
         </Card>
       </div>
@@ -1341,7 +1345,7 @@ export default function App() {
   const monthsToTrigger=equityMomAvg>0&&latest&&!cond1?Math.ceil((0.60-latest.equity)/equityMomAvg):null;
   const eqColor=(eq)=>eq>=0.60?T.green:eq>=0.55?T.amber:T.red;
 
-  const openAdd=()=>{setEditIdx(null);setForm({gross:"",margin:"",w2:latest?String(latest.w2):"871",bills:latest?String(latest.bills):"801",actualDivs:"",actualInterest:"",date:new Date().toISOString().slice(0,7)});setPdfStatus(null);setSaveError(null);setShowAdd(true);};
+  const openAdd=()=>{setEditIdx(null);setForm({gross:"",margin:"",w2:"",bills:"",actualDivs:"",actualInterest:"",date:new Date().toISOString().slice(0,7)});setPdfStatus(null);setSaveError(null);setShowAdd(true);};
   const openEdit=(idx)=>{const e=entries[idx];setEditIdx(idx);setForm({gross:String(e.gross),margin:String(e.margin),w2:String(e.w2),bills:String(e.bills),actualDivs:e.actualDivs!=null?String(e.actualDivs):"",actualInterest:e.actualInterest!=null?String(e.actualInterest):"",date:e.date});setPdfStatus(null);setSaveError(null);setShowAdd(true);};
 
   const handleSave=async()=>{
@@ -1349,7 +1353,7 @@ export default function App() {
     const g=parseNum(form.gross),m=parseNum(form.margin),w=parseNum(form.w2),b=parseNum(form.bills);
     if(!form.gross.trim()){setSaveError("Gross Portfolio is required.");return;}
     if(g<=0){setSaveError("Gross Portfolio must be greater than 0.");return;}
-    if(!form.w2.trim()||w<=0){setSaveError("W2 Deposit is required.");return;}
+    if(!form.w2.trim()||w<=0){setSaveError("Monthly Deposits is required.");return;}
     if(!form.bills.trim()||b<=0){setSaveError("Bills Floated is required.");return;}
     try{
       const actualDivs=form.actualDivs.trim()!==""?parseNum(form.actualDivs):null;
@@ -1367,13 +1371,27 @@ export default function App() {
   const handleDelete=async(idx)=>{const n=entries.filter((_,i)=>i!==idx);setEntries(n);await saveEntries(n);};
 
   const handlePdfFile=async(file)=>{
-    if(!file||file.type!=="application/pdf"){setPdfStatus("error: not a PDF");return;}
+    const name = (file.name || "").toLowerCase();
+    if(!file || (!name.endsWith(".pdf") && file.type !== "application/pdf")){setPdfStatus("error: please upload a PDF file");return;}
     setPdfLoading(true);setPdfStatus(null);
     try{
       const extracted=await extractStatementFromPdf(file);
       if(extracted.gross>0){
-        setForm(f=>({...f,gross:String(extracted.gross),margin:String(extracted.margin||0),actualDivs:extracted.dividends>0?String(extracted.dividends):f.actualDivs,actualInterest:extracted.interest>0?String(extracted.interest):f.actualInterest,date:extracted.date||f.date}));
-        setPdfStatus("success");
+        setForm(f=>({
+          ...f,
+          gross: String(extracted.gross),
+          margin: String(extracted.margin||0),
+          actualDivs: extracted.dividends>0 ? String(extracted.dividends) : f.actualDivs,
+          actualInterest: extracted.interest>0 ? String(extracted.interest) : f.actualInterest,
+          date: extracted.date||f.date,
+          // Pre-fill Monthly Deposits from Electronic Transfers-Credits if found, otherwise keep existing
+          w2: extracted.electronicCredits>0 ? String(extracted.electronicCredits) : f.w2,
+          // Pre-fill Bills from Automated Payments if found, otherwise keep existing
+          bills: extracted.automatedPayments>0 ? String(extracted.automatedPayments) : f.bills,
+        }));
+        const hasDeposits = extracted.electronicCredits>0;
+        const hasBills = extracted.automatedPayments>0;
+        setPdfStatus("success" + (hasDeposits||hasBills ? "-partial" : ""));
       }else{setPdfStatus("error: gross was 0 — check PDF");}
     }catch(err){setPdfStatus("error: " + (err?.message || String(err)));}
     setPdfLoading(false);
@@ -1612,7 +1630,7 @@ export default function App() {
                 <div style={{fontSize:11,fontWeight:700,color:T.textMuted,letterSpacing:"1px",marginBottom:8}}>AUTO-FILL FROM PDF</div>
                 <input type="file" accept="application/pdf" ref={fileInputRef} style={{display:"none"}} onChange={e=>{if(e.target.files[0])handlePdfFile(e.target.files[0]);e.target.value="";}}/>
                 <div className="pdf-drop" onClick={()=>fileInputRef.current?.click()} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();if(e.dataTransfer.files[0])handlePdfFile(e.dataTransfer.files[0]);}}>
-                  {pdfLoading?(<div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,padding:"4px 0"}}><div style={{width:18,height:18,border:`2px solid ${T.border}`,borderTopColor:T.blueMid,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/><span style={{fontSize:12,color:T.textSub}}>Reading your statement…</span></div>):pdfStatus==="success"?(<div style={{fontSize:12,color:T.green,fontWeight:600}}>✓ Statement read — Gross, Margin, Dividends, Interest, and Month auto-filled. Verify before saving.</div>):pdfStatus&&pdfStatus.startsWith("error")?(<div style={{fontSize:12,color:T.red}}>⚠ {pdfStatus}</div>):(<div><div style={{fontSize:13,fontWeight:600,color:T.text,marginBottom:4}}>📄 Upload E-Trade Statement PDF</div><div style={{fontSize:11,color:T.textMuted}}>Extracts Gross, Margin, Dividends, Interest, and Month automatically</div></div>)}
+                  {pdfLoading?(<div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,padding:"4px 0"}}><div style={{width:18,height:18,border:`2px solid ${T.border}`,borderTopColor:T.blueMid,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/><span style={{fontSize:12,color:T.textSub}}>Reading your statement…</span></div>):pdfStatus==="success"?(<div style={{fontSize:12,color:T.green,fontWeight:600}}>✓ Statement read — all fields auto-filled. Verify before saving.</div>):pdfStatus==="success-partial"?(<div><div style={{fontSize:12,color:T.green,fontWeight:600}}>✓ Statement read — Gross, Margin, Dividends, Interest, Month filled.</div><div style={{fontSize:11,color:T.amber,marginTop:4}}>⚠ Monthly Deposits = total ACH credits from statement. Bills = total automated payments. Verify both before saving — they may include non-payroll transfers.</div></div>):pdfStatus&&pdfStatus.startsWith("error")?(<div style={{fontSize:12,color:T.red}}>⚠ {pdfStatus}</div>):(<div><div style={{fontSize:13,fontWeight:600,color:T.text,marginBottom:4}}>📄 Upload E-Trade Statement PDF</div><div style={{fontSize:11,color:T.textMuted}}>Extracts Gross, Margin, Dividends, Interest, and Month automatically</div></div>)}
                 </div>
               </div>
             )}
@@ -1622,7 +1640,7 @@ export default function App() {
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
                 <Input label="GROSS PORTFOLIO / TOTAL ASSETS ($)" value={form.gross} onChange={e=>{setSaveError(null);setForm(f=>({...f,gross:e.target.value}));}} placeholder="e.g. 5,419.12"/>
                 <Input label="MARGIN BALANCE ($)" value={form.margin} onChange={e=>{setSaveError(null);setForm(f=>({...f,margin:e.target.value}));}} placeholder="e.g. 1,654.71"/>
-                <Input label="W2 DEPOSIT / MO ($)" value={form.w2} onChange={e=>{setSaveError(null);setForm(f=>({...f,w2:e.target.value}));}} placeholder="e.g. 871"/>
+                <Input label="MONTHLY DEPOSITS ($)" hint="auto-filled from statement" value={form.w2} onChange={e=>{setSaveError(null);setForm(f=>({...f,w2:e.target.value}));}} placeholder="e.g. 871"/>
                 <div>
                   <div style={{fontSize:11,fontWeight:600,color:T.textMuted,marginBottom:5}}>BILLS FLOATED / MO ($)</div>
                   <input value={form.bills} onChange={e=>{setSaveError(null);setForm(f=>({...f,bills:e.target.value}));}} placeholder="e.g. 801" style={{width:"100%",padding:"10px 13px",background:T.surfaceAlt,border:`1.5px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,color:T.text,fontFamily:"inherit",outline:"none"}}/>
@@ -1635,7 +1653,7 @@ export default function App() {
               </div>
             </div>
             <div style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"12px 14px",marginBottom:20,fontSize:11,color:T.textMuted,lineHeight:1.7}}>
-              <strong style={{color:T.text}}>Gross = Total Assets</strong> (Balance Sheet) &nbsp;·&nbsp; <strong style={{color:T.green}}>Dividends</strong> = Income and Distribution Summary &nbsp;·&nbsp; <strong style={{color:T.red}}>Interest</strong> = Margin Loan Interest Schedule → Total
+              <strong style={{color:T.text}}>Gross = Total Assets</strong> (Balance Sheet) &nbsp;·&nbsp; <strong style={{color:T.text}}>Monthly Deposits</strong> = Electronic Transfers-Credits &nbsp;·&nbsp; <strong style={{color:T.green}}>Dividends</strong> = Income and Distribution Summary &nbsp;·&nbsp; <strong style={{color:T.red}}>Interest</strong> = Margin Loan Interest Schedule → Total
             </div>
             <div style={{display:"flex",gap:10}}>
               <button onClick={handleSave} style={{flex:1,padding:"12px",background:T.text,color:"#fff",border:"none",borderRadius:T.radiusXs,fontSize:13,fontWeight:700,fontFamily:"inherit",cursor:"pointer"}}>{editIdx!==null?"Save Changes":"Save Entry"}</button>
