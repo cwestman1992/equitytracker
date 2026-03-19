@@ -101,14 +101,16 @@ const ASSET_CLASS_COLORS = {
 };
 
 const CATS = {
-  housing:      { label: "Housing",     icon: "🏠", color: T.blue,    bg: T.blueBg,    border: T.blueBorder },
-  transport:    { label: "Transport",   icon: "🚗", color: T.amber,   bg: T.amberBg,   border: T.amberBorder },
-  insurance:    { label: "Insurance",   icon: "🛡️", color: T.violet,  bg: T.violetBg,  border: T.violetBorder },
-  debt:         { label: "Debt",        icon: "💳", color: T.red,     bg: T.redBg,     border: T.redBorder },
-  utilities:    { label: "Utilities",   icon: "⚡", color: T.indigo,  bg: T.indigoBg,  border: T.indigoBorder },
-  subscriptions:{ label: "Subs",        icon: "📱", color: T.textSub, bg: T.surfaceAlt,border: T.border },
-  food:         { label: "Food",        icon: "🛒", color: T.green,   bg: T.greenBg,   border: T.greenBorder },
-  other:        { label: "Other",       icon: "📌", color: T.textMuted,bg: T.surfaceAlt,border: T.border },
+  housing:      { label: "Housing",      icon: "🏠", color: T.blue,     bg: T.blueBg,    border: T.blueBorder },
+  transport:    { label: "Transport",    icon: "🚗", color: T.amber,    bg: T.amberBg,   border: T.amberBorder },
+  insurance:    { label: "Insurance",    icon: "🛡️", color: T.violet,   bg: T.violetBg,  border: T.violetBorder },
+  debt:         { label: "Debt",         icon: "💳", color: T.red,      bg: T.redBg,     border: T.redBorder },
+  studentloan:  { label: "Student Loan", icon: "🎓", color: T.indigo,   bg: T.indigoBg,  border: T.indigoBorder },
+  childcare:    { label: "Childcare",    icon: "👶", color: T.rose,     bg: T.roseBg,    border: T.roseBorder },
+  utilities:    { label: "Utilities",    icon: "⚡", color: T.indigo,   bg: T.indigoBg,  border: T.indigoBorder },
+  subscriptions:{ label: "Subs",         icon: "📱", color: T.textSub,  bg: T.surfaceAlt,border: T.border },
+  food:         { label: "Food",         icon: "🛒", color: T.green,    bg: T.greenBg,   border: T.greenBorder },
+  other:        { label: "Other",        icon: "📌", color: T.textMuted,bg: T.surfaceAlt,border: T.border },
 };
 
 // ── SHARED COMPONENTS ─────────────────────────────────────────────────────────
@@ -240,7 +242,41 @@ Include EVERY position listed under Stocks, ETFs & Closed-End Funds sections. Fo
   });
   const data = await response.json();
   const text = (data.content || []).map(b => b.text || "").join("");
-  return JSON.parse(text.replace(/```json|```/g, "").trim());
+  const result = JSON.parse(text.replace(/```json|```/g, "").trim());
+  if (result.positions) {
+    result.positions = result.positions.map(p => ({ ...p, bucket: p.bucket || assignBucket(p.ticker) }));
+  }
+  return result;
+}
+
+// ── BUCKET MAP ────────────────────────────────────────────────────────────────
+// Default bucket assignments for known tickers. Users can override per-snapshot.
+const BUCKET_MAP = {
+  // B1 — Growth Anchors (price appreciation, lower yield)
+  SPYG:"B1", TQQQ:"B1", QQQ:"B1", NVDA:"B1", AMZN:"B1", COST:"B1",
+  MCD:"B1", MSTR:"B1", KGC:"B1", AAAU:"B1", XAR:"B1", PARR:"B1",
+  GOOG:"B1", GOOGL:"B1", SPY:"B1", VOO:"B1", VGT:"B1", ARKK:"B1",
+  "BRK.B":"B1", BRKA:"B1", BRKB:"B1", AAPL:"B1", MSFT:"B1",
+  // B2 — CEF Compounders (DRIP at NAV discount)
+  CLM:"B2", CRF:"B2", GOF:"B2", ECAT:"B2", PTY:"B2", PCI:"B2",
+  PDI:"B2", RFI:"B2", QQQH:"B2", XQQI:"B2", UTF:"B2", UTG:"B2",
+  // B3 — High-Yield Workhorses (NAV erosion expected)
+  QQQI:"B3", SPYI:"B3", XDTE:"B3", RDTE:"B3", QDTE:"B3", WDTE:"B3",
+  IWMY:"B3", QQQY:"B3", NVDY:"B3", BRKW:"B3", HOOY:"B3", WPAY:"B3",
+  O:"B3", IAUI:"B3", KSLV:"B3", USOY:"B3", MSTY:"B3", TSII:"B3",
+  BITX:"B3", BTCI:"B3", YMAX:"B3", YMAG:"B3", ULTY:"B3", CONY:"B3",
+  AMZY:"B3", TSLY:"B3", GOOGY:"B3", PLTY:"B3", APLY:"B3",
+};
+
+const BUCKET_LABELS = {
+  B1: { label: "B1 — Growth", icon: "📈", color: T.blue,    bg: T.blueBg,    border: T.blueBorder },
+  B2: { label: "B2 — CEFs",   icon: "🏦", color: T.violet,  bg: T.violetBg,  border: T.violetBorder },
+  B3: { label: "B3 — High Yield", icon: "💰", color: T.amber, bg: T.amberBg, border: T.amberBorder },
+  Unassigned: { label: "Unassigned", icon: "❓", color: T.textMuted, bg: T.surfaceAlt, border: T.border },
+};
+
+function assignBucket(ticker) {
+  return BUCKET_MAP[ticker?.toUpperCase()] || "Unassigned";
 }
 
 // ── E-TRADE CSV PARSER ────────────────────────────────────────────────────────
@@ -322,7 +358,8 @@ function parseETradeCSV(text) {
       unrealizedGL: gl,
       estAnnIncome: eai,
       currentYield: yld,
-      assetClass: "Equities", // E-Trade CSV doesn't include asset class
+      assetClass: "Equities",
+      bucket: assignBucket(sym),
     });
 
     totalMV  += mv;
@@ -637,10 +674,10 @@ function BillTrackerTab({ billItems, setBillItems, saveBills, latest, settings }
 // ── HOLDINGS TAB ──────────────────────────────────────────────────────────────
 function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
   const [uploading, setUploading] = useState(false);
-  const [uploadStatus, setUploadStatus] = useState(null); // null | "success" | "error"
+  const [uploadStatus, setUploadStatus] = useState(null);
   const [sortBy, setSortBy] = useState("marketValue");
   const [sortDir, setSortDir] = useState("desc");
-  const [filterClass, setFilterClass] = useState("All");
+  const [filterBucket, setFilterBucket] = useState("All");
   const fileInputRef = useRef(null);
 
   const latest = holdingSnapshots.length ? holdingSnapshots[holdingSnapshots.length - 1] : null;
@@ -652,14 +689,11 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
     if (!isPdf && !isCsv) { setUploadStatus("error: please upload a .pdf or .csv file"); return; }
     setUploading(true); setUploadStatus(null);
     try {
-      const data = isPdf
-        ? await extractHoldingsFromPdf(file)
-        : await extractHoldingsFromCsv(file);
+      const data = isPdf ? await extractHoldingsFromPdf(file) : await extractHoldingsFromCsv(file);
       if (data.positions && data.positions.length > 0) {
         const snapshot = { ...data, id: Date.now(), uploadedAt: Date.now() };
         const updated = [...holdingSnapshots, snapshot];
-        setHoldingSnapshots(updated);
-        saveHoldings(updated);
+        setHoldingSnapshots(updated); saveHoldings(updated);
         setUploadStatus("success");
       } else { setUploadStatus("error: no positions found in response"); }
     } catch(err) { setUploadStatus("error: " + (err?.message || String(err))); }
@@ -671,20 +705,41 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
     setHoldingSnapshots(updated); saveHoldings(updated);
   };
 
-  // Sort & filter positions
-  const positions = useMemo(() => {
-    if (!latest?.positions) return [];
-    let pts = filterClass === "All" ? latest.positions : latest.positions.filter(p => p.assetClass === filterClass);
-    return [...pts].sort((a, b) => {
-      const aVal = a[sortBy] || 0, bVal = b[sortBy] || 0;
-      return sortDir === "desc" ? bVal - aVal : aVal - bVal;
+  // Let user change bucket for a position in the latest snapshot
+  const updateBucket = (ticker, newBucket) => {
+    if (!latest) return;
+    const updated = holdingSnapshots.map(s => {
+      if (s.id !== latest.id) return s;
+      return { ...s, positions: s.positions.map(p => p.ticker === ticker ? { ...p, bucket: newBucket } : p) };
     });
-  }, [latest, sortBy, sortDir, filterClass]);
+    setHoldingSnapshots(updated); saveHoldings(updated);
+  };
 
   const toggleSort = (col) => {
     if (sortBy === col) setSortDir(d => d === "desc" ? "asc" : "desc");
     else { setSortBy(col); setSortDir("desc"); }
   };
+
+  // Bucket allocation data
+  const bucketData = useMemo(() => {
+    if (!latest?.positions) return [];
+    const totalMV = latest.positions.reduce((s, p) => s + (p.marketValue || 0), 0);
+    const totals = {};
+    const eaiTotals = {};
+    latest.positions.forEach(p => {
+      const b = p.bucket || "Unassigned";
+      totals[b] = (totals[b] || 0) + (p.marketValue || 0);
+      eaiTotals[b] = (eaiTotals[b] || 0) + (p.estAnnIncome || 0);
+    });
+    return ["B1","B2","B3","Unassigned"].filter(b => totals[b] > 0).map(b => ({
+      key: b,
+      value: totals[b],
+      eai: eaiTotals[b] || 0,
+      pct: totalMV > 0 ? totals[b] / totalMV : 0,
+      count: latest.positions.filter(p => (p.bucket || "Unassigned") === b).length,
+      ...BUCKET_LABELS[b],
+    }));
+  }, [latest]);
 
   // Blended yield from holdings
   const holdingsBlendedYield = useMemo(() => {
@@ -694,80 +749,76 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
     return totalMV > 0 ? totalEAI / totalMV : null;
   }, [latest]);
 
-  // Asset class totals for allocation bar
-  const allocationData = useMemo(() => {
-    if (!latest?.allocation) return [];
-    const alloc = latest.allocation;
-    const total = Math.abs(alloc.equities || 0) + Math.abs(alloc.fixedIncome || 0) + Math.abs(alloc.alternatives || 0);
-    return [
-      { label: "Equities", value: alloc.equities || 0, pct: total ? (alloc.equities || 0) / total : 0 },
-      { label: "Fixed Income & Pref", value: alloc.fixedIncome || 0, pct: total ? (alloc.fixedIncome || 0) / total : 0 },
-      { label: "Alternatives", value: alloc.alternatives || 0, pct: total ? (alloc.alternatives || 0) / total : 0 },
-    ].filter(d => d.value > 0);
-  }, [latest]);
+  // Filtered + sorted positions
+  const positions = useMemo(() => {
+    if (!latest?.positions) return [];
+    let pts = filterBucket === "All" ? latest.positions :
+      latest.positions.filter(p => (p.bucket || "Unassigned") === filterBucket);
+    return [...pts].sort((a, b) => {
+      const aVal = a[sortBy] || 0, bVal = b[sortBy] || 0;
+      return sortDir === "desc" ? bVal - aVal : aVal - bVal;
+    });
+  }, [latest, sortBy, sortDir, filterBucket]);
 
-  const assetClasses = ["All", ...Array.from(new Set((latest?.positions || []).map(p => p.assetClass).filter(Boolean)))];
+  const [openPicker, setOpenPicker] = useState(null); // ticker string of open bucket picker
 
   const SortHeader = ({ col, children }) => (
-    <th onClick={() => toggleSort(col)} style={{ padding: "8px 12px", textAlign: "right", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: sortBy === col ? T.text : T.textMuted, cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}>
+    <th onClick={() => toggleSort(col)} style={{ padding: "8px 10px", textAlign: "right", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: sortBy === col ? T.text : T.textMuted, cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}>
       {children} {sortBy === col ? (sortDir === "desc" ? "↓" : "↑") : ""}
     </th>
   );
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      {/* Upload area */}
+      {/* Upload */}
       <Card>
         <SectionLabel>UPLOAD PORTFOLIO SNAPSHOT</SectionLabel>
         <input type="file" accept="application/pdf,.csv,text/csv" ref={fileInputRef} style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleFile(e.target.files[0]); e.target.value = ""; }} />
-        <div className="pdf-drop" onClick={() => fileInputRef.current?.click()}
-          onDragOver={e => e.preventDefault()}
-          onDrop={e => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}>          {uploading ? (
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "8px 0" }}>
+        <div className="pdf-drop" onClick={() => fileInputRef.current?.click()} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}>
+          {uploading ? (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
               <div style={{ width: 18, height: 18, border: `2px solid ${T.border}`, borderTopColor: T.blueMid, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
-              <span style={{ fontSize: 12, color: T.textSub }}>Reading your portfolio statement…</span>
+              <span style={{ fontSize: 12, color: T.textSub }}>Reading your portfolio…</span>
             </div>
           ) : uploadStatus === "success" ? (
-            <div style={{ fontSize: 12, color: T.green, fontWeight: 600 }}>✓ Portfolio snapshot saved — {latest?.positions?.length} positions extracted</div>
-          ) : uploadStatus === "error" ? (
+            <div style={{ fontSize: 12, color: T.green, fontWeight: 600 }}>✓ Snapshot saved — {latest?.positions?.length} positions, buckets auto-assigned</div>
+          ) : uploadStatus?.startsWith("error") ? (
             <div style={{ fontSize: 12, color: T.red }}>⚠ {uploadStatus}</div>
           ) : (
             <div>
               <div style={{ fontSize: 13, fontWeight: 600, color: T.text, marginBottom: 4 }}>📊 Upload Portfolio — PDF or CSV</div>
-              <div style={{ fontSize: 11, color: T.textMuted }}>
-                <strong style={{ color: T.text }}>CSV (recommended):</strong> E-Trade → Accounts → Portfolio → Export — instant, free, no AI needed
-              </div>
-              <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}>
-                <strong style={{ color: T.text }}>PDF:</strong> Upload your monthly statement — Claude AI extracts all positions automatically
-              </div>
-              <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}>Upload anytime — weekly after paycheck deploys or whenever you add new positions</div>
+              <div style={{ fontSize: 11, color: T.textMuted }}><strong style={{ color: T.text }}>CSV (recommended):</strong> E-Trade → Accounts → Portfolio → Export — instant, free, buckets auto-assigned</div>
+              <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}><strong style={{ color: T.text }}>PDF:</strong> Monthly statement — Claude AI extracts all positions</div>
             </div>
           )}
         </div>
         {holdingSnapshots.length > 0 && (
-          <div style={{ marginTop: 16 }}>
+          <div style={{ marginTop: 14 }}>
             <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "1.5px", color: T.textMuted, marginBottom: 8 }}>SNAPSHOT HISTORY</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {[...holdingSnapshots].reverse().slice(0, 5).map(s => (
-                <div key={s.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", background: s.id === latest?.id ? T.greenBg : T.surfaceAlt, border: `1px solid ${s.id === latest?.id ? T.greenBorder : T.border}`, borderRadius: T.radiusSm }}>
-                  <div>
-                    <span style={{ fontSize: 12, fontWeight: 600, color: T.text }}>{fmtTS(s.uploadedAt)}</span>
-                    {s.id === latest?.id && <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 20, background: T.greenBg, color: T.green, border: `1px solid ${T.greenBorder}`, marginLeft: 8 }}>LATEST</span>}
-                    <div style={{ fontSize: 11, color: T.textMuted, marginTop: 2 }}>{s.positions?.length} positions · Net {fmt$(s.netValue || 0)} · {s.positions ? fmtPct((s.totalEstAnnIncome || 0) / ((s.totalAssets || 1) - (s.marginLoan || 0)), 1) + " yield" : ""}</div>
-                  </div>
-                  <button onClick={() => deleteSnapshot(s.id)} style={{ background: "none", border: `1px solid ${T.border}`, color: T.textMuted, borderRadius: T.radiusXs, padding: "3px 10px", fontSize: 11, fontFamily: "inherit", cursor: "pointer" }}>✕</button>
+            {[...holdingSnapshots].reverse().slice(0, 5).map(s => (
+              <div key={s.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", background: s.id === latest?.id ? T.greenBg : T.surfaceAlt, border: `1px solid ${s.id === latest?.id ? T.greenBorder : T.border}`, borderRadius: T.radiusSm, marginBottom: 6 }}>
+                <div>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: T.text }}>{fmtTS(s.uploadedAt)}</span>
+                  {s.id === latest?.id && <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 20, background: T.greenBg, color: T.green, border: `1px solid ${T.greenBorder}`, marginLeft: 8 }}>LATEST</span>}
+                  <div style={{ fontSize: 11, color: T.textMuted, marginTop: 2 }}>{s.positions?.length} positions · {fmt$(s.netValue || 0)} net value</div>
                 </div>
-              ))}
-            </div>
+                <button onClick={() => deleteSnapshot(s.id)} style={{ background: "none", border: `1px solid ${T.border}`, color: T.textMuted, borderRadius: T.radiusXs, padding: "3px 10px", fontSize: 11, fontFamily: "inherit", cursor: "pointer" }}>✕</button>
+              </div>
+            ))}
           </div>
         )}
       </Card>
 
       {!latest ? (
-        <Card><div style={{ textAlign: "center", padding: 48, color: T.textMuted }}><div style={{ fontSize: 32, marginBottom: 12 }}>📊</div><div style={{ fontSize: 14, fontWeight: 600, color: T.textSub, marginBottom: 8 }}>No holdings snapshots yet</div><div style={{ fontSize: 12, lineHeight: 1.7 }}>Upload your E-Trade statement above to see your full portfolio breakdown, position-level yields, and asset allocation.</div></div></Card>
+        <Card><div style={{ textAlign: "center", padding: 48, color: T.textMuted }}>
+          <div style={{ fontSize: 32, marginBottom: 12 }}>📊</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: T.textSub, marginBottom: 8 }}>No holdings snapshots yet</div>
+          <div style={{ fontSize: 12, lineHeight: 1.7 }}>Upload your E-Trade portfolio CSV or PDF statement to see position-level yields, bucket allocation, and unrealized G/L.</div>
+        </div></Card>
       ) : (
-        <div style={{display:"flex",flexDirection:"column",gap:20}}>
-          {/* Key metrics */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+          {/* Key metrics row */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr", gap: 14 }}>
             {[
               { l: "TOTAL ASSETS", v: fmt$(latest.totalAssets || 0), c: T.text },
@@ -785,76 +836,70 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
             ))}
           </div>
 
-          {/* Unrealized G/L + allocation */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-            <Card>
-              <SectionLabel>UNREALIZED GAIN / LOSS</SectionLabel>
-              <div style={{ fontSize: 40, fontWeight: 700, color: (latest.totalUnrealizedGL || 0) >= 0 ? T.green : T.red, fontFamily: "'Lora', serif" }}>
-                {(latest.totalUnrealizedGL || 0) >= 0 ? "+" : ""}{fmt$(latest.totalUnrealizedGL || 0)}
-              </div>
-              <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}>total unrealized across all positions</div>
-              <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
-                {["Equities", "Fixed Income & Pref", "Alternatives"].map(cls => {
-                  const pts = (latest.positions || []).filter(p => p.assetClass === cls);
-                  const gl = pts.reduce((s, p) => s + (p.unrealizedGL || 0), 0);
-                  const mv = pts.reduce((s, p) => s + (p.marketValue || 0), 0);
-                  if (!pts.length) return null;
-                  const clr = ASSET_CLASS_COLORS[cls] || { color: T.textMuted, bg: T.surfaceAlt, border: T.border };
-                  return (
-                    <div key={cls} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", background: clr.bg, borderRadius: T.radiusXs, border: `1px solid ${clr.border}` }}>
-                      <span style={{ fontSize: 12, fontWeight: 600, color: clr.color }}>{cls}</span>
-                      <div style={{ textAlign: "right" }}>
-                        <div style={{ fontSize: 13, fontWeight: 700, color: gl >= 0 ? T.green : T.red, fontFamily: "'Lora', serif" }}>{gl >= 0 ? "+" : ""}{fmt$(gl)}</div>
-                        <div style={{ fontSize: 10, color: T.textMuted }}>{fmt$(mv)} market value</div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </Card>
-            <Card>
-              <SectionLabel>ASSET ALLOCATION</SectionLabel>
-              {allocationData.length > 0 && (
-                <div>
-                  {/* Stacked bar */}
-                  <div style={{ height: 16, borderRadius: 8, overflow: "hidden", display: "flex", marginBottom: 20 }}>
-                    {allocationData.map(d => {
-                      const clr = ASSET_CLASS_COLORS[d.label] || { color: T.textMuted };
-                      return <div key={d.label} style={{ width: `${d.pct * 100}%`, background: clr.color, opacity: 0.75, transition: "width 0.4s" }} title={`${d.label}: ${fmt$(d.value)}`} />;
-                    })}
+          {/* Bucket allocation */}
+          <Card>
+            <SectionLabel>BUCKET ALLOCATION</SectionLabel>
+            {/* Stacked bar */}
+            <div style={{ height: 14, borderRadius: 7, overflow: "hidden", display: "flex", marginBottom: 20 }}>
+              {bucketData.map(b => (
+                <div key={b.key} style={{ width: `${b.pct * 100}%`, background: b.color, opacity: 0.75, transition: "width 0.4s", cursor: "pointer" }} onClick={() => setFilterBucket(filterBucket === b.key ? "All" : b.key)} title={`${b.label}: ${fmtPct(b.pct, 0)}`} />
+              ))}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: `repeat(${bucketData.length}, 1fr)`, gap: 12 }}>
+              {bucketData.map(b => (
+                <div key={b.key} onClick={() => setFilterBucket(filterBucket === b.key ? "All" : b.key)}
+                  style={{ padding: "16px", borderRadius: T.radiusSm, background: filterBucket === b.key ? b.bg : T.surfaceAlt, border: `2px solid ${filterBucket === b.key ? b.color : T.borderLight}`, cursor: "pointer", transition: "all 0.18s" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                    <span style={{ fontSize: 18 }}>{b.icon}</span>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: b.color }}>{b.label}</div>
+                    <span style={{ fontSize: 10, color: T.textMuted }}>{b.count} positions</span>
                   </div>
-                  {allocationData.map(d => {
-                    const clr = ASSET_CLASS_COLORS[d.label] || { color: T.textMuted, bg: T.surfaceAlt, border: T.border };
-                    const pts = (latest.positions || []).filter(p => p.assetClass === d.label);
-                    const totalEAI = pts.reduce((s, p) => s + (p.estAnnIncome || 0), 0);
-                    return (
-                      <div key={d.label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: `1px solid ${T.borderLight}` }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                          <div style={{ width: 10, height: 10, borderRadius: 2, background: clr.color, opacity: 0.75 }} />
-                          <div>
-                            <div style={{ fontSize: 12, fontWeight: 600, color: T.text }}>{d.label}</div>
-                            <div style={{ fontSize: 10, color: T.textMuted }}>{pts.length} positions · {fmt$(totalEAI, 0)}/yr income</div>
-                          </div>
-                        </div>
-                        <div style={{ textAlign: "right" }}>
-                          <div style={{ fontSize: 14, fontWeight: 700, color: T.text, fontFamily: "'Lora', serif" }}>{fmt$(d.value)}</div>
-                          <div style={{ fontSize: 10, color: T.textMuted }}>{fmtPct(d.pct, 0)} of equity positions</div>
-                        </div>
-                      </div>
-                    );
-                  })}
+                  <div style={{ fontSize: 22, fontWeight: 700, color: b.color, fontFamily: "'Lora', serif" }}>{fmtPct(b.pct, 0)}</div>
+                  <div style={{ fontSize: 12, color: T.textSub, marginTop: 4 }}>{fmt$(b.value)} market value</div>
+                  <div style={{ fontSize: 11, color: T.green, marginTop: 2 }}>{fmt$(b.eai, 0)}/yr income</div>
                 </div>
-              )}
-            </Card>
-          </div>
+              ))}
+            </div>
+            <div style={{ marginTop: 14, fontSize: 11, color: T.textMuted }}>
+              Click a bucket to filter the positions table. Bucket assignments are auto-detected from ticker. Click the Bucket column in the table to reassign.
+            </div>
+          </Card>
+
+          {/* Unrealized G/L */}
+          <Card>
+            <SectionLabel>UNREALIZED GAIN / LOSS</SectionLabel>
+            <div style={{ fontSize: 40, fontWeight: 700, color: (latest.totalUnrealizedGL || 0) >= 0 ? T.green : T.red, fontFamily: "'Lora', serif" }}>
+              {(latest.totalUnrealizedGL || 0) >= 0 ? "+" : ""}{fmt$(latest.totalUnrealizedGL || 0)}
+            </div>
+            <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4, marginBottom: 16 }}>total unrealized across all positions</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+              {bucketData.map(b => {
+                const pts = (latest.positions || []).filter(p => (p.bucket || "Unassigned") === b.key);
+                const gl = pts.reduce((s, p) => s + (p.unrealizedGL || 0), 0);
+                const mv = pts.reduce((s, p) => s + (p.marketValue || 0), 0);
+                return (
+                  <div key={b.key} style={{ padding: "12px", background: b.bg, borderRadius: T.radiusSm, border: `1px solid ${b.border}` }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: b.color, marginBottom: 6 }}>{b.icon} {b.label}</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: gl >= 0 ? T.green : T.red, fontFamily: "'Lora', serif" }}>{gl >= 0 ? "+" : ""}{fmt$(gl)}</div>
+                    <div style={{ fontSize: 10, color: T.textMuted, marginTop: 3 }}>{fmt$(mv)} market value</div>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
 
           {/* Positions table */}
           <Card>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
-              <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "1.5px", color: T.textMuted }}>{positions.length} POSITIONS {filterClass !== "All" ? `— ${filterClass.toUpperCase()}` : ""}</div>
+              <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "1.5px", color: T.textMuted }}>
+                {positions.length} POSITIONS {filterBucket !== "All" ? `— ${BUCKET_LABELS[filterBucket]?.label?.toUpperCase()}` : "— ALL BUCKETS"}
+              </div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                {assetClasses.map(cls => (
-                  <button key={cls} onClick={() => setFilterClass(cls)} style={{ padding: "4px 12px", background: filterClass === cls ? T.text : T.surfaceAlt, color: filterClass === cls ? "#fff" : T.textSub, border: `1px solid ${filterClass === cls ? T.text : T.border}`, borderRadius: 20, fontSize: 11, fontWeight: 600, fontFamily: "inherit", cursor: "pointer", transition: "all 0.15s" }}>{cls}</button>
+                {["All", ...["B1","B2","B3","Unassigned"].filter(b => (latest.positions||[]).some(p => (p.bucket||"Unassigned") === b))].map(b => (
+                  <button key={b} onClick={() => setFilterBucket(b)}
+                    style={{ padding: "4px 12px", background: filterBucket === b ? T.text : T.surfaceAlt, color: filterBucket === b ? "#fff" : T.textSub, border: `1px solid ${filterBucket === b ? T.text : T.border}`, borderRadius: 20, fontSize: 11, fontWeight: 600, fontFamily: "inherit", cursor: "pointer", transition: "all 0.15s" }}>
+                    {b === "All" ? "All" : BUCKET_LABELS[b]?.label || b}
+                  </button>
                 ))}
               </div>
             </div>
@@ -862,36 +907,54 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                 <thead>
                   <tr style={{ borderBottom: `2px solid ${T.border}` }}>
-                    <th style={{ padding: "8px 12px", textAlign: "left", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.textMuted }}>TICKER</th>
-                    <th style={{ padding: "8px 12px", textAlign: "left", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.textMuted }}>NAME</th>
+                    <th style={{ padding: "8px 10px", textAlign: "left", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.textMuted }}>TICKER</th>
                     <SortHeader col="quantity">SHARES</SortHeader>
                     <SortHeader col="sharePrice">PRICE</SortHeader>
-                    <SortHeader col="marketValue">MARKET VALUE</SortHeader>
-                    <SortHeader col="totalCost">COST BASIS</SortHeader>
-                    <SortHeader col="unrealizedGL">UNREAL. G/L</SortHeader>
-                    <SortHeader col="estAnnIncome">EST ANN INC</SortHeader>
+                    <SortHeader col="marketValue">VALUE</SortHeader>
+                    <SortHeader col="totalCost">COST</SortHeader>
+                    <SortHeader col="unrealizedGL">G/L $</SortHeader>
+                    <SortHeader col="estAnnIncome">ANN INC</SortHeader>
                     <SortHeader col="currentYield">YIELD %</SortHeader>
-                    <th style={{ padding: "8px 12px", textAlign: "left", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.textMuted }}>CLASS</th>
+                    <th style={{ padding: "8px 10px", textAlign: "left", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.textMuted }}>BUCKET</th>
                   </tr>
                 </thead>
                 <tbody>
                   {positions.map((p, i) => {
-                    const clr = ASSET_CLASS_COLORS[p.assetClass] || { color: T.textMuted, bg: T.surfaceAlt, border: T.border };
+                    const bk = BUCKET_LABELS[p.bucket || "Unassigned"] || BUCKET_LABELS.Unassigned;
                     return (
                       <tr key={i} style={{ borderBottom: `1px solid ${T.borderLight}` }}
                         onMouseEnter={ev => ev.currentTarget.style.background = T.surfaceAlt}
                         onMouseLeave={ev => ev.currentTarget.style.background = "transparent"}>
-                        <td style={{ padding: "11px 12px", fontWeight: 800, color: T.text, fontFamily: "'Lora', serif" }}>{p.ticker}</td>
-                        <td style={{ padding: "11px 12px", color: T.textSub, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</td>
-                        <td style={{ padding: "11px 12px", textAlign: "right", color: T.textSub }}>{p.quantity?.toFixed(3)}</td>
-                        <td style={{ padding: "11px 12px", textAlign: "right", color: T.textSub }}>{fmt$(p.sharePrice || 0)}</td>
-                        <td style={{ padding: "11px 12px", textAlign: "right", fontWeight: 700, color: T.text, fontFamily: "'Lora', serif" }}>{fmt$(p.marketValue || 0)}</td>
-                        <td style={{ padding: "11px 12px", textAlign: "right", color: T.textSub }}>{fmt$(p.totalCost || 0)}</td>
-                        <td style={{ padding: "11px 12px", textAlign: "right", fontWeight: 700, color: (p.unrealizedGL || 0) >= 0 ? T.green : T.red, fontFamily: "'Lora', serif" }}>{(p.unrealizedGL || 0) >= 0 ? "+" : ""}{fmt$(p.unrealizedGL || 0)}</td>
-                        <td style={{ padding: "11px 12px", textAlign: "right", color: T.green }}>{fmt$(p.estAnnIncome || 0)}</td>
-                        <td style={{ padding: "11px 12px", textAlign: "right", fontWeight: 700, color: (p.currentYield || 0) > 20 ? T.green : T.indigo }}>{(p.currentYield || 0).toFixed(2)}%</td>
-                        <td style={{ padding: "11px 12px" }}>
-                          <span style={{ fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 20, background: clr.bg, color: clr.color, border: `1px solid ${clr.border}`, whiteSpace: "nowrap" }}>{p.assetClass}</span>
+                        <td style={{ padding: "10px 10px", fontWeight: 800, color: T.text, fontFamily: "'Lora', serif" }}>{p.ticker}</td>
+                        <td style={{ padding: "10px 10px", textAlign: "right", color: T.textSub }}>{p.quantity?.toFixed(3)}</td>
+                        <td style={{ padding: "10px 10px", textAlign: "right", color: T.textSub }}>{fmt$(p.sharePrice || 0)}</td>
+                        <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: T.text }}>{fmt$(p.marketValue || 0)}</td>
+                        <td style={{ padding: "10px 10px", textAlign: "right", color: T.textSub }}>{fmt$(p.totalCost || 0)}</td>
+                        <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: (p.unrealizedGL || 0) >= 0 ? T.green : T.red }}>
+                          {(p.unrealizedGL || 0) >= 0 ? "+" : ""}{fmt$(p.unrealizedGL || 0)}
+                        </td>
+                        <td style={{ padding: "10px 10px", textAlign: "right", color: T.green }}>{fmt$(p.estAnnIncome || 0)}</td>
+                        <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: (p.currentYield || 0) > 20 ? T.green : T.indigo }}>
+                          {(p.currentYield || 0).toFixed(2)}%
+                        </td>
+                        <td style={{ padding: "10px 10px", position: "relative" }}>
+                          <button onClick={() => setOpenPicker(openPicker === p.ticker ? null : p.ticker)}
+                            style={{ fontSize: 9, fontWeight: 700, padding: "2px 8px", borderRadius: 20, background: bk.bg, color: bk.color, border: `1px solid ${bk.border}`, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+                            {bk.icon} {p.bucket || "?"}
+                          </button>
+                          {openPicker === p.ticker && (
+                            <div style={{ position: "absolute", top: "100%", left: 0, background: T.surface, border: `1px solid ${T.border}`, borderRadius: T.radiusSm, boxShadow: T.shadowHover, zIndex: 10, padding: 6, minWidth: 140 }}>
+                              {["B1","B2","B3","Unassigned"].map(b => {
+                                const bl = BUCKET_LABELS[b];
+                                return (
+                                  <button key={b} onClick={() => { updateBucket(p.ticker, b); setOpenPicker(null); }}
+                                    style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "6px 10px", background: (p.bucket||"Unassigned") === b ? bl.bg : "transparent", border: "none", borderRadius: T.radiusXs, cursor: "pointer", fontFamily: "inherit", fontSize: 11, color: bl.color, fontWeight: (p.bucket||"Unassigned") === b ? 700 : 400 }}>
+                                    {bl.icon} {bl.label}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
                         </td>
                       </tr>
                     );
@@ -899,14 +962,16 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
                 </tbody>
                 <tfoot>
                   <tr style={{ borderTop: `2px solid ${T.border}`, background: T.surfaceAlt }}>
-                    <td colSpan={4} style={{ padding: "11px 12px", fontWeight: 700, color: T.text }}>TOTAL ({positions.length} positions)</td>
-                    <td style={{ padding: "11px 12px", textAlign: "right", fontWeight: 800, color: T.text, fontFamily: "'Lora', serif" }}>{fmt$(positions.reduce((s, p) => s + (p.marketValue || 0), 0))}</td>
-                    <td style={{ padding: "11px 12px", textAlign: "right", fontWeight: 700, color: T.textSub }}>{fmt$(positions.reduce((s, p) => s + (p.totalCost || 0), 0))}</td>
-                    <td style={{ padding: "11px 12px", textAlign: "right", fontWeight: 800, color: positions.reduce((s, p) => s + (p.unrealizedGL || 0), 0) >= 0 ? T.green : T.red, fontFamily: "'Lora', serif" }}>
+                    <td style={{ padding: "10px 10px", fontWeight: 700, color: T.text }}>TOTAL ({positions.length})</td>
+                    <td />
+                    <td />
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 800, color: T.text }}>{fmt$(positions.reduce((s, p) => s + (p.marketValue || 0), 0))}</td>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: T.textSub }}>{fmt$(positions.reduce((s, p) => s + (p.totalCost || 0), 0))}</td>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 800, color: positions.reduce((s, p) => s + (p.unrealizedGL || 0), 0) >= 0 ? T.green : T.red }}>
                       {positions.reduce((s, p) => s + (p.unrealizedGL || 0), 0) >= 0 ? "+" : ""}{fmt$(positions.reduce((s, p) => s + (p.unrealizedGL || 0), 0))}
                     </td>
-                    <td style={{ padding: "11px 12px", textAlign: "right", fontWeight: 700, color: T.green }}>{fmt$(positions.reduce((s, p) => s + (p.estAnnIncome || 0), 0))}</td>
-                    <td style={{ padding: "11px 12px", textAlign: "right", fontWeight: 700, color: T.indigo }}>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: T.green }}>{fmt$(positions.reduce((s, p) => s + (p.estAnnIncome || 0), 0))}</td>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: T.indigo }}>
                       {positions.reduce((s, p) => s + (p.marketValue || 0), 0) > 0 ? fmtPct(positions.reduce((s, p) => s + (p.estAnnIncome || 0), 0) / positions.reduce((s, p) => s + (p.marketValue || 0), 0), 1) : "—"}
                     </td>
                     <td />
@@ -920,6 +985,7 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
     </div>
   );
 }
+
 
 // ── DIVIDENDS TAB ─────────────────────────────────────────────────────────────
 function DividendsTab({ computed }) {
@@ -1433,8 +1499,8 @@ export default function App() {
       <div style={{background:T.surface,borderBottom:`1px solid ${T.border}`,padding:"0 32px",position:"sticky",top:0,zIndex:40}}>
         <div style={{maxWidth:1280,margin:"0 auto",display:"flex",justifyContent:"space-between",alignItems:"center",height:64}}>
           <div style={{display:"flex",alignItems:"baseline",gap:12}}>
-            <div style={{fontSize:18,fontWeight:800,color:T.text,fontFamily:"'Lora', serif"}}>P2P Equity Tracker</div>
-            <div style={{fontSize:11,color:T.textMuted}}>Paycheck to Portfolio</div>
+            <div style={{fontSize:18,fontWeight:800,color:T.text,fontFamily:"'Lora', serif"}}>YieldStack</div>
+            <div style={{fontSize:11,color:T.textMuted}}>Dividend Income Tracker</div>
           </div>
           <div style={{display:"flex",gap:10,alignItems:"center"}}>
             {daysUntilLog!==null&&(<div style={{padding:"5px 14px",borderRadius:20,fontSize:11,fontWeight:600,background:daysUntilLog<=3?T.redBg:daysUntilLog<=7?T.amberBg:T.surfaceAlt,color:daysUntilLog<=3?T.red:daysUntilLog<=7?T.amber:T.textMuted,border:`1px solid ${daysUntilLog<=3?T.redBorder:daysUntilLog<=7?T.amberBorder:T.border}`}}>{daysUntilLog>0?`Log in ${daysUntilLog}d`:daysUntilLog===0?"Log due today":"Log overdue"}</div>)}
