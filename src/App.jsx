@@ -641,9 +641,10 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
   const latest = holdingSnapshots.length ? holdingSnapshots[holdingSnapshots.length - 1] : null;
 
   const handleFile = async (file) => {
-    const isPdf = file.type === "application/pdf";
-    const isCsv = file.type === "text/csv" || file.name.endsWith(".csv");
-    if (!isPdf && !isCsv) { setUploadStatus("error: please upload a PDF or CSV file"); return; }
+    const name = file.name.toLowerCase();
+    const isPdf = name.endsWith(".pdf");
+    const isCsv = name.endsWith(".csv");
+    if (!isPdf && !isCsv) { setUploadStatus("error: please upload a .pdf or .csv file"); return; }
     setUploading(true); setUploadStatus(null);
     try {
       const data = isPdf
