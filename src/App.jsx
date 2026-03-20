@@ -11,17 +11,115 @@ const parseNum = (s) => { const n = parseFloat(String(s).replace(/,/g, "")); ret
 const fmt$ = (v, dec = 2) => "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec });
 const fmtPct = (v, dec = 2) => (v * 100).toFixed(dec) + "%";
 
+const SUPABASE_KEY = "p2p-supabase-config-v1";
+
 // ── STORAGE ───────────────────────────────────────────────────────────────────
+// Priority: Supabase (cross-device) → window.storage (Claude artifact) → localStorage (Vercel)
 const store = {
+  _sb: null, // { url, anonKey } loaded at runtime
+
+  async _getSupabase() {
+    if (this._sb) return this._sb;
+    try {
+      const cfg = localStorage.getItem(SUPABASE_KEY);
+      if (cfg) this._sb = JSON.parse(cfg);
+    } catch {}
+    return this._sb;
+  },
+
+  async _sbFetch(method, key, value) {
+    const sb = await this._getSupabase();
+    if (!sb?.url || !sb?.anonKey) return null;
+    const base = `${sb.url}/rest/v1/yieldstack_data`;
+    const headers = {
+      "apikey": sb.anonKey,
+      "Authorization": `Bearer ${sb.anonKey}`,
+      "Content-Type": "application/json",
+      "Prefer": "resolution=merge-duplicates",
+    };
+    try {
+      if (method === "GET") {
+        const r = await fetch(`${base}?key=eq.${encodeURIComponent(key)}&select=value`, { headers });
+        if (!r.ok) return null;
+        const rows = await r.json();
+        return rows?.[0]?.value ?? null;
+      }
+      if (method === "SET") {
+        const r = await fetch(base, { method: "POST", headers, body: JSON.stringify({ key, value }) });
+        return r.ok;
+      }
+    } catch { return null; }
+  },
+
   async get(key) {
+    // Try Supabase first
+    const sbVal = await this._sbFetch("GET", key);
+    if (sbVal !== null) return sbVal;
+    // Fallback
     try { if (window.storage?.get) { const r = await window.storage.get(key); return r?.value ?? null; } } catch {}
     try { return localStorage.getItem(key); } catch { return null; }
   },
+
   async set(key, value) {
-    try { if (window.storage?.set) { await window.storage.set(key, value); return; } } catch {}
+    // Write to Supabase if configured
+    await this._sbFetch("SET", key, value);
+    // Always also write locally as backup
+    try { if (window.storage?.set) { await window.storage.set(key, value); } } catch {}
     try { localStorage.setItem(key, value); } catch {}
   },
+
+  setSupabaseConfig(url, anonKey) {
+    this._sb = { url, anonKey };
+    try { localStorage.setItem(SUPABASE_KEY, JSON.stringify({ url, anonKey })); } catch {}
+  },
+
+  clearSupabaseConfig() {
+    this._sb = null;
+    try { localStorage.removeItem(SUPABASE_KEY); } catch {}
+  },
+
+  getSupabaseConfig() {
+    try {
+      const cfg = localStorage.getItem(SUPABASE_KEY);
+      return cfg ? JSON.parse(cfg) : null;
+    } catch { return null; }
+  },
 };
+
+// ── EXPORT / IMPORT ───────────────────────────────────────────────────────────
+function exportAllData(entries, settings, billItems, holdingSnapshots) {
+  const payload = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    entries, settings, billItems, holdingSnapshots,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `yieldstack-backup-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function importAllData(file, setEntries, setSettings, setBillItems, setHoldingSnapshots, saveEntries, saveSettings, saveBills, saveHoldings) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (!data.version || !Array.isArray(data.entries)) throw new Error("Invalid backup file");
+        if (data.entries) { setEntries(data.entries); await saveEntries(data.entries); }
+        if (data.settings) { setSettings(data.settings); await saveSettings(data.settings); }
+        if (data.billItems) { setBillItems(data.billItems); await saveBills(data.billItems); }
+        if (data.holdingSnapshots) { setHoldingSnapshots(data.holdingSnapshots); await saveHoldings(data.holdingSnapshots); }
+        resolve(data);
+      } catch(err) { reject(err); }
+    };
+    reader.onerror = () => reject(new Error("Could not read file"));
+    reader.readAsText(file);
+  });
+}
 
 // ── DATE HELPERS ──────────────────────────────────────────────────────────────
 const parseYM = (dateStr) => { const [yr, mo] = dateStr.split("-").map(Number); return new Date(yr, mo - 1, 1); };
@@ -43,6 +141,7 @@ function projectMinEquity(gross, margin, divs, w2, bills, marginRate, yield_, mo
   return Math.min(...projectCurve(gross, margin, divs, w2, bills, marginRate, yield_, months, appreciation).map(p => p.equity));
 }
 function projectFreedomMonths(gross, margin, divs, w2, bills, marginRate, yield_, appreciation = 0) {
+  if (!bills || bills <= 0) return null; // no bills = nothing to cover = freedom date meaningless
   let g = gross, m = margin, d = divs; const ma = appreciation / 12;
   for (let i = 1; i <= 600; i++) {
     const draw = Math.max(0, bills - d); g += w2; g *= (1 + ma); m += draw + m * marginRate / 12; m = Math.max(0, m); d = g * yield_ / 12;
@@ -343,13 +442,11 @@ function parseETradeCSV(text) {
   // Map exact E-Trade column names
   const iSymbol  = h("Symbol");
   const iPrice   = h("Last Price");
-  const iPaid    = h("Price Paid");
   const iQty     = h("Qty");
   const iCostSh  = h("Cost/Share");
   const iGL      = h("Total Gain $");
   const iValue   = h("Value $");
   const iYield   = h("Dividend Yield");
-  const iPct     = h("% of Portfolio");
   const iEAI     = h("Est. Annual Income");
 
   const parseV = (v) => {
@@ -371,8 +468,7 @@ function parseETradeCSV(text) {
 
     const qty   = parseV(row[iQty]);
     const price = parseV(row[iPrice]);
-    const paid  = parseV(row[iPaid] !== undefined ? row[iPaid] : row[iCostSh]);
-    const costSh= parseV(row[iCostSh] !== undefined ? row[iCostSh] : row[iPaid]);
+    const costSh= parseV(row[iCostSh] !== undefined ? row[iCostSh] : 0);
     const mv    = parseV(row[iValue]);
     const gl    = parseV(row[iGL]);
     const yld   = parseV(row[iYield]);
@@ -408,11 +504,13 @@ function parseETradeCSV(text) {
   const cashLine = lines.find(l => parseRow(l)[iSymbol]?.trim() === "CASH");
   const cashMV = cashLine ? parseV(parseRow(cashLine)[iValue]) : 0;
 
+  // E-Trade portfolio CSV does not include margin loan data.
+  // We set marginLoan to null (not 0) so the UI can warn the user to enter it manually.
   return {
     date: new Date().toISOString().slice(0, 7),
     positions,
     totalAssets: totalMV + cashMV,
-    marginLoan: 0,
+    marginLoan: null,  // null = not known from CSV, user must enter manually
     netValue: totalMV + cashMV,
     allocation: {
       equities:     totalMV,
@@ -505,7 +603,13 @@ function BillModelerTab({ latest, settings }) {
     });
   }, [amounts, labels, latest, settings, growthMode, appreciationRate]);
 
-  if (!latest) return <Card><div style={{textAlign:"center",padding:40,color:T.textMuted}}>Log at least one month to use the Bill Modeler.</div></Card>;
+  if (!latest) return (
+    <Card><div style={{textAlign:"center",padding:40,color:T.textMuted}}>
+      <div style={{fontSize:32,marginBottom:12}}>📋</div>
+      <div style={{fontSize:14,fontWeight:600,color:T.textSub,marginBottom:8}}>Log at least one month to use the Bill Modeler</div>
+      <div style={{fontSize:12,lineHeight:1.7}}>The Bill Modeler needs your Monthly Deposits and Bills Floated amounts from a log entry. Holdings snapshots alone aren't enough — log one month first, then the modeler will use your current holdings data for portfolio values.</div>
+    </div></Card>
+  );
 
   return (
     <div style={{display:"flex",flexDirection:"column",gap:20}}>
@@ -522,7 +626,7 @@ function BillModelerTab({ latest, settings }) {
         </div>
       </div>
       <Card style={{padding:"16px 24px"}}>
-        <SectionLabel>STARTING STATE — FROM LATEST LOG</SectionLabel>
+        <SectionLabel>{latest?.fromHoldings?"STARTING STATE — FROM HOLDINGS SNAPSHOT":"STARTING STATE — FROM LATEST LOG"}</SectionLabel>
         <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12}}>
           {[{l:"Gross",v:fmt$(latest.gross)},{l:"Margin",v:fmt$(latest.margin)},{l:"Equity",v:fmtPct(latest.equity),c:latest.equity>=0.60?T.green:T.amber},{l:"Bills/Mo",v:fmt$(latest.bills)},{l:"Dividends/Mo",v:fmt$(latest.effectiveDivs),c:T.green}].map(({l,v,c})=>(
             <div key={l} style={{textAlign:"center"}}><div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:4}}>{l}</div><div style={{fontSize:14,fontWeight:700,color:c||T.text}}>{v}</div></div>
@@ -713,9 +817,21 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
   const [sortBy, setSortBy] = useState("marketValue");
   const [sortDir, setSortDir] = useState("desc");
   const [filterBucket, setFilterBucket] = useState("All");
+  const [marginEntry, setMarginEntry] = useState(""); // for CSV uploads where margin is unknown
   const fileInputRef = useRef(null);
 
   const latest = holdingSnapshots.length ? holdingSnapshots[holdingSnapshots.length - 1] : null;
+  const csvNeedsMargin = latest?.marginLoan === null || latest?.marginLoan === undefined;
+
+  const saveMarginEntry = () => {
+    const m = parseNum(marginEntry);
+    if (!latest || isNaN(m) || m < 0) return;
+    const updated = holdingSnapshots.map(s =>
+      s.id === latest.id ? { ...s, marginLoan: m, netValue: s.totalAssets - m } : s
+    );
+    setHoldingSnapshots(updated); saveHoldings(updated);
+    setMarginEntry("");
+  };
 
   const handleFile = async (file) => {
     const name = file.name.toLowerCase();
@@ -835,11 +951,26 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
                 <div>
                   <span style={{ fontSize: 12, fontWeight: 600, color: T.text }}>{fmtTS(s.uploadedAt)}</span>
                   {s.id === latest?.id && <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 20, background: T.greenBg, color: T.green, border: `1px solid ${T.greenBorder}`, marginLeft: 8 }}>LATEST</span>}
-                  <div style={{ fontSize: 11, color: T.textMuted, marginTop: 2 }}>{s.positions?.length} positions · {fmt$(s.netValue || 0)} net value</div>
+                  <div style={{ fontSize: 11, color: T.textMuted, marginTop: 2 }}>{s.positions?.length} positions · {fmt$(s.netValue || 0)} net value · {(s.marginLoan === null || s.marginLoan === undefined) ? <span style={{color:T.amber,fontWeight:600}}>margin unknown</span> : `${fmt$(s.marginLoan)} margin`}</div>
                 </div>
                 <button onClick={() => deleteSnapshot(s.id)} style={{ background: "none", border: `1px solid ${T.border}`, color: T.textMuted, borderRadius: T.radiusXs, padding: "3px 10px", fontSize: 11, fontFamily: "inherit", cursor: "pointer" }}>✕</button>
               </div>
             ))}
+          </div>
+        )}
+        {/* Margin entry prompt for CSV uploads */}
+        {csvNeedsMargin && (
+          <div style={{ marginTop: 12, padding: "14px 16px", background: T.amberBg, border: `1px solid ${T.amberBorder}`, borderRadius: T.radiusSm }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: T.amber, marginBottom: 6 }}>⚠ Margin balance not in CSV — enter it manually</div>
+            <div style={{ fontSize: 11, color: T.textSub, marginBottom: 10, lineHeight: 1.6 }}>E-Trade portfolio CSV exports don't include your margin loan balance. Enter it here so equity %, stress test, and projections are accurate. Find it in E-Trade → Balances → Margin Balance, or on your statement Balance Sheet → Cash, BDP, MMFs (Debit).</div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ color: T.textMuted, fontSize: 13 }}>$</span>
+                <input value={marginEntry} onChange={e => setMarginEntry(e.target.value)} placeholder="e.g. 1,654.71" style={{ width: 140, padding: "8px 12px", background: T.surface, border: `1.5px solid ${T.amberBorder}`, borderRadius: T.radiusXs, fontSize: 13, fontWeight: 700, color: T.text, fontFamily: "inherit", outline: "none" }} />
+              </div>
+              <button onClick={saveMarginEntry} style={{ padding: "8px 18px", background: T.amber, color: "#fff", border: "none", borderRadius: T.radiusXs, fontSize: 12, fontWeight: 700, fontFamily: "inherit", cursor: "pointer" }}>Save Margin Balance</button>
+              <button onClick={() => { const updated = holdingSnapshots.map(s => s.id === latest?.id ? { ...s, marginLoan: 0 } : s); setHoldingSnapshots(updated); saveHoldings(updated); }} style={{ padding: "8px 14px", background: "transparent", color: T.textMuted, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, fontSize: 12, fontFamily: "inherit", cursor: "pointer" }}>No Margin (set to $0)</button>
+            </div>
           </div>
         )}
       </Card>
@@ -1089,7 +1220,7 @@ function DividendsTab({ computed }) {
         <SectionLabel>COMPLETE DIVIDEND HISTORY</SectionLabel>
         <div style={{overflowX:"auto"}}>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-            <thead><tr style={{borderBottom:`2px solid ${T.border}`}}>{["Month","Dividends","Type","MoM ($)","MoM (%)","${maWindow}-Mo Avg","Cumulative","Annual Rate"].map(h=><th key={h} style={{padding:"8px 14px",textAlign:"left",fontSize:10,fontWeight:700,letterSpacing:"1px",color:T.textMuted}}>{h}</th>)}</tr></thead>
+            <thead><tr style={{borderBottom:`2px solid ${T.border}`}}>{["Month","Dividends","Type","MoM ($)","MoM (%)",`${maWindow}-Mo Avg`,"Cumulative","Annual Rate"].map(h=><th key={h} style={{padding:"8px 14px",textAlign:"left",fontSize:10,fontWeight:700,letterSpacing:"1px",color:T.textMuted}}>{h}</th>)}</tr></thead>
             <tbody>
               {[...computed].reverse().map((e,revIdx)=>{const i=computed.length-1-revIdx;const mom$=momDollar[i];const momP=momPct[i];const ma=maValues[i];return(
                 <tr key={i} style={{borderBottom:`1px solid ${T.borderLight}`}} onMouseEnter={ev=>ev.currentTarget.style.background=T.surfaceAlt} onMouseLeave={ev=>ev.currentTarget.style.background="transparent"}>
@@ -1137,7 +1268,13 @@ function RecoveryChart({ postCrashGross, margin, divs, w2, bills, marginRate, yi
 function StressTestTab({ latest, settings }) {
   const [drawdown, setDrawdown] = useState(25);
   const [nextBillAmt, setNextBillAmt] = useState("200");
-  if (!latest) return <Card><div style={{textAlign:"center",padding:48,color:T.textMuted}}>Log at least one month to run stress tests.</div></Card>;
+  if (!latest) return (
+    <Card><div style={{textAlign:"center",padding:48,color:T.textMuted}}>
+      <div style={{fontSize:32,marginBottom:12}}>🛡️</div>
+      <div style={{fontSize:14,fontWeight:600,color:T.textSub,marginBottom:8}}>Log at least one month to run stress tests</div>
+      <div style={{fontSize:12,lineHeight:1.7}}>The Stress Test needs your Monthly Deposits and Bills Floated amounts from a log entry to model recovery scenarios. Log one month first — if you've uploaded holdings, your current portfolio values will be used automatically.</div>
+    </div></Card>
+  );
   const {gross,margin,effectiveDivs:divs,w2,bills,equity:precrashEquity}=latest;
   const {marginRate,effectiveYield:yield_}=settings;
   const d=drawdown/100; const postCrashGross=gross*(1-d); const postCrashEquity=margin>0?(postCrashGross-margin)/postCrashGross:1.0;
@@ -1201,9 +1338,26 @@ function StressTestTab({ latest, settings }) {
 }
 
 // ── SETTINGS TAB ──────────────────────────────────────────────────────────────
-function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdingsYield, hasHoldings }) {
+function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdingsYield, hasHoldings, onExport, onImport, importStatus }) {
   const [local, setLocal] = useState({ ...settings, marginRateStr: (settings.marginRate*100).toFixed(2), targetYieldStr: (settings.targetYield*100).toFixed(1) });
+  const [sbUrl, setSbUrl] = useState(() => store.getSupabaseConfig()?.url || "");
+  const [sbKey, setSbKey] = useState(() => store.getSupabaseConfig()?.anonKey || "");
+  const [sbStatus, setSbStatus] = useState(store.getSupabaseConfig() ? "connected" : null);
+  const importRef = useRef(null);
+
   const apply = () => { const mr=parseNum(local.marginRateStr)/100; const ty=parseNum(local.targetYieldStr)/100; if(mr>0&&mr<1&&ty>0&&ty<2)setSettings(s=>({...s,marginRate:mr,targetYield:ty,yieldMode:local.yieldMode})); };
+
+  const connectSupabase = () => {
+    if (!sbUrl.includes("supabase.co") || sbKey.length < 20) { setSbStatus("error"); return; }
+    store.setSupabaseConfig(sbUrl.trim(), sbKey.trim());
+    setSbStatus("connected");
+  };
+
+  const disconnectSupabase = () => {
+    store.clearSupabaseConfig();
+    setSbUrl(""); setSbKey(""); setSbStatus(null);
+  };
+
   const yieldModes = [
     { id: "manual", label: "Manual Override", desc: "You set the yield percentage" },
     { id: "auto", label: "Auto — from Dividends", desc: "Derived from your actual dividend logs" },
@@ -1270,6 +1424,58 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
         <button onClick={apply} style={{padding:"11px 28px",background:T.text,color:"#fff",border:"none",borderRadius:T.radiusXs,fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>Save Settings</button>
         <button onClick={()=>{setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0"});setSettings(DEFAULT_SETTINGS);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
       </div>
+
+      {/* ── EXPORT / IMPORT ── */}
+      <Card>
+        <SectionLabel>BACKUP & RESTORE</SectionLabel>
+        <div style={{fontSize:12,color:T.textSub,marginBottom:16,lineHeight:1.7}}>
+          Export all your data (log entries, bills, holdings snapshots, settings) as a JSON file. Import it on any device to restore everything instantly.
+        </div>
+        <div style={{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
+          <button onClick={onExport} style={{padding:"10px 20px",background:T.greenBg,color:T.green,border:`1px solid ${T.greenBorder}`,borderRadius:T.radiusXs,fontSize:13,fontWeight:700,fontFamily:"inherit",cursor:"pointer"}}>⬇ Export Backup</button>
+          <button onClick={()=>importRef.current?.click()} style={{padding:"10px 20px",background:T.blueBg,color:T.blue,border:`1px solid ${T.blueBorder}`,borderRadius:T.radiusXs,fontSize:13,fontWeight:700,fontFamily:"inherit",cursor:"pointer"}}>⬆ Import Backup</button>
+          <input ref={importRef} type="file" accept=".json" style={{display:"none"}} onChange={e=>{if(e.target.files[0])onImport(e.target.files[0]);e.target.value="";}}/>
+          {importStatus==="success"&&<span style={{fontSize:12,color:T.green,fontWeight:600}}>✓ Import successful — all data restored</span>}
+          {importStatus==="error"&&<span style={{fontSize:12,color:T.red,fontWeight:600}}>⚠ Import failed — check the file is a valid YieldStack backup</span>}
+        </div>
+        <div style={{marginTop:12,padding:"10px 14px",background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusXs,fontSize:11,color:T.amber,lineHeight:1.6}}>
+          💡 <strong>Tip:</strong> Export after each monthly log session. Keep the file in Google Drive or Dropbox so it's accessible from any device.
+        </div>
+      </Card>
+
+      {/* ── SUPABASE SYNC ── */}
+      <Card>
+        <SectionLabel>CROSS-DEVICE SYNC (SUPABASE)</SectionLabel>
+        <div style={{fontSize:12,color:T.textSub,marginBottom:16,lineHeight:1.7}}>
+          Connect a free Supabase database for automatic cross-device sync. Once set up, every save instantly syncs — no more manual exports.
+        </div>
+        {sbStatus === "connected" ? (
+          <div>
+            <div style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",background:T.greenBg,border:`1px solid ${T.greenBorder}`,borderRadius:T.radiusSm,marginBottom:12}}>
+              <div style={{width:10,height:10,borderRadius:"50%",background:T.greenMid,boxShadow:`0 0 8px ${T.greenMid}88`}}/>
+              <div><div style={{fontSize:12,fontWeight:700,color:T.green}}>Supabase connected</div><div style={{fontSize:11,color:T.textSub,marginTop:2}}>{sbUrl}</div></div>
+              <button onClick={disconnectSupabase} style={{marginLeft:"auto",padding:"6px 14px",background:"transparent",color:T.red,border:`1px solid ${T.redBorder}`,borderRadius:T.radiusXs,fontSize:12,fontFamily:"inherit",cursor:"pointer"}}>Disconnect</button>
+            </div>
+            <div style={{fontSize:11,color:T.textMuted}}>All saves now sync automatically. Your data is available on any device with this Supabase project configured.</div>
+          </div>
+        ) : (
+          <div>
+            <div style={{display:"flex",flexDirection:"column",gap:10,marginBottom:14}}>
+              <Input label="SUPABASE PROJECT URL" value={sbUrl} onChange={e=>setSbUrl(e.target.value)} placeholder="https://xxxxxxxxxxxx.supabase.co"/>
+              <Input label="SUPABASE ANON KEY" value={sbKey} onChange={e=>setSbKey(e.target.value)} placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."/>
+            </div>
+            {sbStatus==="error"&&<div style={{fontSize:11,color:T.red,marginBottom:10}}>⚠ Check your URL and key — URL should end in .supabase.co</div>}
+            <button onClick={connectSupabase} style={{padding:"10px 20px",background:T.text,color:"#fff",border:"none",borderRadius:T.radiusXs,fontSize:13,fontWeight:700,fontFamily:"inherit",cursor:"pointer"}}>Connect Supabase</button>
+            <div style={{marginTop:14,padding:"14px 16px",background:T.indigoBg,border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusSm,fontSize:11,color:T.indigo,lineHeight:1.8}}>
+              <strong style={{display:"block",marginBottom:6}}>Setup (takes ~3 minutes, free):</strong>
+              1. Go to <strong>supabase.com</strong> → New project (free tier)<br/>
+              2. In the SQL Editor, run: <code style={{background:T.surface,padding:"1px 5px",borderRadius:3,fontSize:10}}>CREATE TABLE yieldstack_data (key text PRIMARY KEY, value text);</code><br/>
+              3. Go to <strong>Settings → API</strong> → copy Project URL and anon/public key<br/>
+              4. Paste both above and click Connect
+            </div>
+          </div>
+        )}
+      </Card>
     </div>
   );
 }
@@ -1366,6 +1572,7 @@ export default function App() {
   const [pdfLoading, setPdfLoading] = useState(false);
   const [pdfStatus, setPdfStatus] = useState(null);
   const [saveError, setSaveError] = useState(null);
+  const [importStatus, setImportStatus] = useState(null);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -1380,8 +1587,25 @@ export default function App() {
 
   const saveEntries = useCallback(async (data) => { try { await store.set(STORAGE_KEY, JSON.stringify(data)); } catch {} }, []);
   const setSettings = useCallback(async (updater) => { setSettingsState(prev => { const next=typeof updater==="function"?updater(prev):updater; store.set(SETTINGS_KEY,JSON.stringify(next)).catch(()=>{}); return next; }); }, []);
+  const saveSettingsFile = useCallback(async (data) => { try { await store.set(SETTINGS_KEY, JSON.stringify(data)); } catch {} }, []);
   const saveBills = useCallback(async (data) => { try { await store.set(BILLS_KEY, JSON.stringify(data)); } catch {} }, []);
   const saveHoldings = useCallback(async (data) => { try { await store.set(HOLDINGS_KEY, JSON.stringify(data)); } catch {} }, []);
+
+  const handleExport = useCallback(() => {
+    exportAllData(entries, settings, billItems, holdingSnapshots);
+  }, [entries, settings, billItems, holdingSnapshots]);
+
+  const handleImport = useCallback(async (file) => {
+    setImportStatus(null);
+    try {
+      await importAllData(file, setEntries, setSettingsState, setBillItems, setHoldingSnapshots, saveEntries, saveSettingsFile, saveBills, saveHoldings);
+      setImportStatus("success");
+      setTimeout(() => setImportStatus(null), 4000);
+    } catch {
+      setImportStatus("error");
+      setTimeout(() => setImportStatus(null), 4000);
+    }
+  }, [saveEntries, saveSettingsFile, saveBills, saveHoldings]);
 
   // Yield calculations
   const derivedYield = useMemo(() => {
@@ -1418,7 +1642,7 @@ export default function App() {
     const effectiveDivs=actualDivs!==null?actualDivs:estimatedDivs;
     const prevEff=prev?(prev.actualDivs!=null&&prev.actualDivs!==""?parseNum(prev.actualDivs):prev.gross*effectiveYield/12):null;
     const divGrowth=prevEff!==null?effectiveDivs-prevEff:null;
-    const coverage=effectiveDivs/e.bills;
+    const coverage=e.bills>0?effectiveDivs/e.bills:0;
     const netDraw=Math.max(0,e.bills-effectiveDivs);
     const estimatedInterest=e.margin*settings.marginRate/12;
     const actualInterest=e.actualInterest!=null&&e.actualInterest!==""?parseNum(e.actualInterest):null;
@@ -1439,12 +1663,16 @@ export default function App() {
   const currentSnapshot = useMemo(() => {
     if (!latest && !latestHoldings) return null;
 
-    // If holdings snapshot exists and has real data, use it for portfolio values
     if (latestHoldings && (latestHoldings.totalAssets || 0) > 0) {
       const g = latestHoldings.totalAssets || 0;
-      const m = latestHoldings.marginLoan || 0;
+      // marginLoan is null when loaded from CSV (CSV has no margin column).
+      // Fall back to last log's margin so projections aren't wrong.
+      const marginFromLog = latest?.margin || 0;
+      const m = latestHoldings.marginLoan !== null && latestHoldings.marginLoan !== undefined
+        ? latestHoldings.marginLoan
+        : marginFromLog;
+      const marginIsEstimated = latestHoldings.marginLoan === null || latestHoldings.marginLoan === undefined;
       const equity = g > 0 ? (g - m) / g : 0;
-      // Use holdings EAI for divs if available, otherwise estimate from yield
       const monthlyEAI = latestHoldings.totalEstAnnIncome
         ? latestHoldings.totalEstAnnIncome / 12
         : g * effectiveYield / 12;
@@ -1467,11 +1695,11 @@ export default function App() {
         actualYield: latestHoldings.totalEstAnnIncome && g > 0
           ? latestHoldings.totalEstAnnIncome / g : effectiveYield,
         fromHoldings: true,
+        marginIsEstimated,  // true when margin came from last log, not CSV
         holdingsDate: latestHoldings.uploadedAt,
       };
     }
-    // Fall back to log data
-    return latest ? { ...latest, fromHoldings: false } : null;
+    return latest ? { ...latest, fromHoldings: false, marginIsEstimated: false } : null;
   }, [latest, latestHoldings, effectiveYield, settings.marginRate]);
   const nextBillAmt=parseNum(nextBill)||200;
   let risingStreak=0; for(let i=computed.length-1;i>=1;i--){if(computed[i].rising)risingStreak++;else break;}
@@ -1498,13 +1726,13 @@ export default function App() {
     setEditIdx(null);
     setForm({
       gross:String(latestHoldings.totalAssets||""),
-      margin:String(latestHoldings.marginLoan||0),
+      margin:String(latestHoldings.marginLoan||latest?.margin||0),
       w2:latest?String(latest.w2):"",
       bills:latest?String(latest.bills):"",
       actualDivs:"",actualInterest:"",
       date:new Date().toISOString().slice(0,7),
     });
-    setPdfStatus("success");
+    setPdfStatus("holdings-prefill");
     setSaveError(null);
     setShowAdd(true);
   };
@@ -1529,7 +1757,11 @@ export default function App() {
     }catch{setSaveError("Something went wrong. Please try again.");}
   };
 
-  const handleDelete=async(idx)=>{const n=entries.filter((_,i)=>i!==idx);setEntries(n);await saveEntries(n);};
+  const handleDelete=async(idx)=>{
+    const e=entries[idx];
+    if(!window.confirm(`Delete the entry for ${fmtDate(e.date)}? This cannot be undone.`))return;
+    const n=entries.filter((_,i)=>i!==idx);setEntries(n);await saveEntries(n);
+  };
 
   const handlePdfFile=async(file)=>{
     const name = (file.name || "").toLowerCase();
@@ -1634,6 +1866,11 @@ export default function App() {
                   <button onClick={openLogFromHoldings} style={{fontSize:11,fontWeight:700,color:T.indigo,background:"none",border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusXs,padding:"4px 10px",fontFamily:"inherit",cursor:"pointer"}}>Log This →</button>
                 </div>
               )}
+              {currentSnapshot?.fromHoldings&&currentSnapshot?.marginIsEstimated&&(
+                <div style={{background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusSm,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <div style={{fontSize:11,color:T.amber,fontWeight:600}}>⚠ Margin debt carried from last log entry ({fmt$(currentSnapshot.margin)}) — CSV exports don't include margin. Upload a PDF statement or click "Log from Holdings" to enter your current margin balance.</div>
+                </div>
+              )}
               {(currentSnapshot||computed.length>=2)&&(allGreen?(
                 <div className="trigger-glow" style={{background:T.greenBg,border:`1.5px solid ${T.greenBorder}`,borderRadius:T.radius,padding:"20px 28px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <div><div style={{fontSize:20,fontWeight:800,color:T.green,fontFamily:"'Lora', serif"}}>Add your next bill now</div><div style={{fontSize:12,color:T.textSub,marginTop:4}}>All 3 conditions met — redirect +${nextBillAmt.toLocaleString()}/mo immediately</div></div>
@@ -1683,7 +1920,7 @@ export default function App() {
                 <div style={{marginBottom:14,display:"flex",alignItems:"center",gap:8,fontSize:12,color:T.textSub}}>Next bill:<input value={nextBill} onChange={e=>setNextBill(e.target.value)} style={{width:76,padding:"6px 10px",background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,fontWeight:700,color:T.text,fontFamily:"inherit",outline:"none",textAlign:"right"}}/><span>/mo</span></div>
                 {[
                   {pass:cond1,hd:!!currentSnapshot,label:"Equity ≥ 60%",sub:currentSnapshot?`Currently ${fmtPct(currentSnapshot.equity)}`:"No data yet"},
-                  {pass:cond2,hd:computed.length>1,label:"Rising 2+ months",sub:risingStreak>=2?"Confirmed uptrend ✓":`${risingStreak} of 2 consecutive months`,badge:risingStreak>0?`↑ ${risingStreak}mo`:null},
+                  {pass:cond2,hd:computed.length>1,label:"Rising 2+ months",sub:computed.length<2?"Need 2+ monthly log entries to evaluate streak":risingStreak>=2?"Confirmed uptrend ✓":`${risingStreak} of 2 consecutive months rising`,badge:risingStreak>0?`↑ ${risingStreak}mo`:null},
                   {pass:cond3,hd:!!currentSnapshot,label:"3-month floor ≥ 55%",sub:currentSnapshot?`Projected min: ${fmtPct(projectMinEquity(currentSnapshot.gross,currentSnapshot.margin,currentSnapshot.effectiveDivs,currentSnapshot.w2+nextBillAmt,currentSnapshot.bills+nextBillAmt,settings.marginRate,effectiveYield,3))}`:"No data yet"},
                 ].map(({pass,hd,label,sub,badge})=>(
                   <div key={label} style={{display:"flex",gap:12,padding:"12px 14px",borderRadius:T.radiusSm,marginBottom:8,background:!hd?T.surfaceAlt:pass?T.greenBg:T.redBg,border:`1px solid ${!hd?T.border:pass?T.greenBorder:T.redBorder}`}}>
@@ -1703,7 +1940,7 @@ export default function App() {
                     {[
                       {l:"GROSS",v:fmt$(currentSnapshot.gross),c:T.text},
                       {l:"NET VALUE",v:fmt$(currentSnapshot.gross-currentSnapshot.margin),c:T.text},
-                      {l:"MARGIN DEBT",v:fmt$(currentSnapshot.margin),c:T.red},
+                      {l:"MARGIN DEBT",v:fmt$(currentSnapshot.margin),c:T.red,badge:currentSnapshot.marginIsEstimated?"FROM LOG":null},
                       {l:"EQUITY",v:fmtPct(currentSnapshot.equity),c:eqColor(currentSnapshot.equity)},
                       {l:"DIVS / MO",v:fmt$(currentSnapshot.effectiveDivs),c:T.green,badge:currentSnapshot.fromHoldings?"HOLDINGS":"EST"},
                       {l:"COVERAGE",v:fmtPct(currentSnapshot.coverage,1),c:currentSnapshot.coverage>=1?T.green:T.amber},
@@ -1803,7 +2040,7 @@ export default function App() {
           </Card>
         )}
 
-        {activeTab==="settings"&&<SettingsTab settings={fullSettings} setSettings={setSettings} derivedYield={derivedYield} hasActualData={entries.some(e=>e.actualDivs!=null&&e.actualDivs!=="")} holdingsYield={holdingsYield} hasHoldings={holdingSnapshots.length>0}/>}
+        {activeTab==="settings"&&<SettingsTab settings={fullSettings} setSettings={setSettings} derivedYield={derivedYield} hasActualData={entries.some(e=>e.actualDivs!=null&&e.actualDivs!=="")} holdingsYield={holdingsYield} hasHoldings={holdingSnapshots.length>0} onExport={handleExport} onImport={handleImport} importStatus={importStatus}/>}
         {activeTab==="help"&&<HelpPage/>}
       </div>
 
@@ -1820,7 +2057,7 @@ export default function App() {
                 <div style={{fontSize:11,fontWeight:700,color:T.textMuted,letterSpacing:"1px",marginBottom:8}}>AUTO-FILL FROM PDF</div>
                 <input type="file" accept="application/pdf" ref={fileInputRef} style={{display:"none"}} onChange={e=>{if(e.target.files[0])handlePdfFile(e.target.files[0]);e.target.value="";}}/>
                 <div className="pdf-drop" onClick={()=>fileInputRef.current?.click()} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();if(e.dataTransfer.files[0])handlePdfFile(e.dataTransfer.files[0]);}}>
-                  {pdfLoading?(<div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,padding:"4px 0"}}><div style={{width:18,height:18,border:`2px solid ${T.border}`,borderTopColor:T.blueMid,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/><span style={{fontSize:12,color:T.textSub}}>Reading your statement…</span></div>):pdfStatus==="success"?(<div style={{fontSize:12,color:T.green,fontWeight:600}}>✓ Statement read — all fields auto-filled. Verify before saving.</div>):pdfStatus==="success-partial"?(<div><div style={{fontSize:12,color:T.green,fontWeight:600}}>✓ Statement read — Gross, Margin, Dividends, Interest, Month filled.</div><div style={{fontSize:11,color:T.amber,marginTop:4}}>⚠ Monthly Deposits = total ACH credits from statement. Bills = total automated payments. Verify both before saving — they may include non-payroll transfers.</div></div>):pdfStatus&&pdfStatus.startsWith("error")?(<div style={{fontSize:12,color:T.red}}>⚠ {pdfStatus}</div>):(<div><div style={{fontSize:13,fontWeight:600,color:T.text,marginBottom:4}}>📄 Upload E-Trade Statement PDF</div><div style={{fontSize:11,color:T.textMuted}}>Extracts Gross, Margin, Dividends, Interest, and Month automatically</div></div>)}
+                  {pdfLoading?(<div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,padding:"4px 0"}}><div style={{width:18,height:18,border:`2px solid ${T.border}`,borderTopColor:T.blueMid,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/><span style={{fontSize:12,color:T.textSub}}>Reading your statement…</span></div>):pdfStatus==="holdings-prefill"?(<div style={{fontSize:12,color:T.indigo,fontWeight:600}}>📊 Pre-filled from latest holdings snapshot. Enter Monthly Deposits, Bills, and any actual Dividends received, then save.</div>):pdfStatus==="success"?(<div style={{fontSize:12,color:T.green,fontWeight:600}}>✓ Statement read — all fields auto-filled. Verify before saving.</div>):pdfStatus==="success-partial"?(<div><div style={{fontSize:12,color:T.green,fontWeight:600}}>✓ Statement read — Gross, Margin, Dividends, Interest, Month filled.</div><div style={{fontSize:11,color:T.amber,marginTop:4}}>⚠ Monthly Deposits = total ACH credits from statement. Bills = total automated payments. Verify both before saving — they may include non-payroll transfers.</div></div>):pdfStatus&&pdfStatus.startsWith("error")?(<div style={{fontSize:12,color:T.red}}>⚠ {pdfStatus}</div>):(<div><div style={{fontSize:13,fontWeight:600,color:T.text,marginBottom:4}}>📄 Upload E-Trade Statement PDF</div><div style={{fontSize:11,color:T.textMuted}}>Extracts Gross, Margin, Dividends, Interest, and Month automatically</div></div>)}
                 </div>
               </div>
             )}
@@ -1854,7 +2091,7 @@ export default function App() {
         </div>
       )}
 
-      {showQC&&<QuickCheckModal onClose={()=>setShowQC(false)} latest={latest} settings={fullSettings}/>}
+      {showQC&&<QuickCheckModal onClose={()=>setShowQC(false)} latest={currentSnapshot||latest} settings={fullSettings}/>}
     </div>
   );
 }
