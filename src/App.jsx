@@ -129,11 +129,13 @@ const fmtTS = (ts) => new Date(ts).toLocaleDateString("en-US", { month: "short",
 // ── MATH ──────────────────────────────────────────────────────────────────────
 function projectCurve(gross, margin, divs, w2, bills, marginRate, yield_, months, appreciation = 0) {
   let g = gross, m = margin, d = divs; const ma = appreciation / 12;
-  const pts = [{ month: 0, equity: (g - m) / g, divs: d, margin: m, gross: g, net: g - m }];
+  const pts = [{ month: 0, equity: g > 0 ? (g - m) / g : 0, divs: d, margin: m, gross: g, net: g - m }];
   for (let i = 1; i <= months; i++) {
     const draw = Math.max(0, bills - d);
-    g += w2; g *= (1 + ma); m += draw + m * marginRate / 12; m = Math.max(0, m); d = g * yield_ / 12;
-    pts.push({ month: i, equity: (g - m) / g, divs: d, margin: m, gross: g, net: g - m });
+    g += w2; g *= (1 + ma); g = Math.max(0, g);
+    m += draw + m * marginRate / 12; m = Math.max(0, m);
+    d = g * yield_ / 12;
+    pts.push({ month: i, equity: g > 0 ? (g - m) / g : 0, divs: d, margin: m, gross: g, net: g - m });
   }
   return pts;
 }
@@ -860,9 +862,20 @@ function BillTrackerTab({ billItems, setBillItems, saveBills, latest, settings }
   const totalAll = billItems.reduce((s,b)=>s+b.amount,0);
   const coveragePct = totalAll>0?totalFloated/totalAll:0;
   const nextCandidate = notFloated.length?[...notFloated].sort((a,b)=>b.amount-a.amount)[0]:null;
-  const nextCandidateImpact = nextCandidate&&latest?(()=>{ const amt=nextCandidate.amount; const minEq=projectMinEquity(latest.gross,latest.margin,latest.effectiveDivs,latest.w2+amt,latest.bills+amt,settings.marginRate,settings.effectiveYield,3); return {minEq,safe:minEq>=0.55}; })():null;
+  const nextCandidateImpact = nextCandidate&&latest?(()=>{
+    const amt=nextCandidate.amount;
+    // Use totalFloated (live Bill Tracker state) as the bills base,
+    // NOT latest.bills (which is from last log and may be stale)
+    const currentBills = totalFloated;
+    const minEq=projectMinEquity(latest.gross,latest.margin,latest.effectiveDivs,latest.w2+amt,currentBills+amt,settings.marginRate,settings.effectiveYield,3);
+    return {minEq,safe:minEq>=0.55};
+  })():null;
   const toggleFloat=(id)=>{ const u=billItems.map(b=>b.id===id?{...b,isFloated:!b.isFloated,dateAdded:!b.isFloated?new Date().toISOString().slice(0,7):null}:b); setBillItems(u); saveBills(u); };
-  const deleteBill=(id)=>{ const u=billItems.filter(b=>b.id!==id); setBillItems(u); saveBills(u); };
+  const deleteBill=(id)=>{
+    const bill=billItems.find(b=>b.id===id);
+    if(!window.confirm(`Remove "${bill?.name||"this bill"}" (${fmt$(bill?.amount||0,0)}/mo)? This cannot be undone.`))return;
+    const u=billItems.filter(b=>b.id!==id); setBillItems(u); saveBills(u);
+  };
   const openEdit=(bill)=>{ setEditId(bill.id); setForm({name:bill.name,amount:String(bill.amount),category:bill.category,notes:bill.notes||""}); setShowForm(true); };
   const openAdd=()=>{ setEditId(null); setForm({name:"",amount:"",category:"other",notes:""}); setShowForm(true); };
   const submitForm=()=>{
@@ -993,6 +1006,9 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
   };
 
   const deleteSnapshot = (id) => {
+    const snap = holdingSnapshots.find(s => s.id === id);
+    const label = snap ? fmtTS(snap.uploadedAt) : "this snapshot";
+    if (!window.confirm(`Delete snapshot from ${label}? This cannot be undone.`)) return;
     const updated = holdingSnapshots.filter(s => s.id !== id);
     setHoldingSnapshots(updated); saveHoldings(updated);
   };
@@ -1415,7 +1431,7 @@ function DividendsTab({ computed }) {
         <Card>
           <SectionLabel>MONTH-OVER-MONTH CHANGE ($)</SectionLabel>
           <svg width="100%" viewBox={`0 0 ${W} 120`} style={{overflow:"visible"}}>
-            {(()=>{const momData=momDollar.slice(1);const maxAbs=Math.max(...momData.map(v=>Math.abs(v||0)),10)*1.2;const cH=120,cPad={t:10,r:24,b:28,l:56};const ciW=W-cPad.l-cPad.r,ciH=cH-cPad.t-cPad.b;const midY=cPad.t+ciH/2;const toXm=(i)=>cPad.l+((i+0.5)/momData.length)*ciW;const toYm=(v)=>midY-(v/maxAbs)*(ciH/2);const bW=Math.max(4,Math.min(28,ciW/momData.length-4));return(<g><line x1={cPad.l} x2={cPad.l+ciW} y1={midY} y2={midY} stroke={T.border} strokeWidth="1"/>{momData.map((v,i)=>{if(v===null)return null;const x=toXm(i);const isPos=v>=0;const barH=Math.max(1,(Math.abs(v)/maxAbs)*(ciH/2));return(<g key={i}><rect x={x-bW/2} y={isPos?midY-barH:midY} width={bW} height={barH} fill={isPos?T.greenMid:T.red} opacity="0.75" rx="2"/>{Math.abs(v)>maxAbs*0.1&&<text x={x} y={isPos?midY-barH-4:midY+barH+12} textAnchor="middle" fill={isPos?T.green:T.red} fontSize="8" fontFamily="Nunito" fontWeight="700">{isPos?"+":""}{fmt$(v,0)}</text>}<text x={x} y={cH-4} textAnchor="middle" fill={T.textMuted} fontSize="8" fontFamily="Nunito">{fmtDate(computed[i+1].date)}</text></g>);})}<text x={cPad.l-8} y={midY+4} textAnchor="end" fill={T.textMuted} fontSize="9" fontFamily="Nunito">$0</text></g>);})()}
+            {(()=>{const momData=momDollar.slice(1);const maxAbs=Math.max(...momData.map(v=>Math.abs(v||0)),10)*1.2;const cH=120,cPad={t:10,r:24,b:28,l:56};const ciW=W-cPad.l-cPad.r,ciH=cH-cPad.t-cPad.b;const midY=cPad.t+ciH/2;const toXm=(i)=>cPad.l+((i+0.5)/momData.length)*ciW;const bW=Math.max(4,Math.min(28,ciW/momData.length-4));return(<g><line x1={cPad.l} x2={cPad.l+ciW} y1={midY} y2={midY} stroke={T.border} strokeWidth="1"/>{momData.map((v,i)=>{if(v===null)return null;const x=toXm(i);const isPos=v>=0;const barH=Math.max(1,(Math.abs(v)/maxAbs)*(ciH/2));return(<g key={i}><rect x={x-bW/2} y={isPos?midY-barH:midY} width={bW} height={barH} fill={isPos?T.greenMid:T.red} opacity="0.75" rx="2"/>{Math.abs(v)>maxAbs*0.1&&<text x={x} y={isPos?midY-barH-4:midY+barH+12} textAnchor="middle" fill={isPos?T.green:T.red} fontSize="8" fontFamily="Nunito" fontWeight="700">{isPos?"+":""}{fmt$(v,0)}</text>}<text x={x} y={cH-4} textAnchor="middle" fill={T.textMuted} fontSize="8" fontFamily="Nunito">{fmtDate(computed[i+1].date)}</text></g>);})}<text x={cPad.l-8} y={midY+4} textAnchor="end" fill={T.textMuted} fontSize="9" fontFamily="Nunito">$0</text></g>);})()}
           </svg>
         </Card>
       )}
@@ -1833,7 +1849,16 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
   const [sbStatus, setSbStatus] = useState(store.getSupabaseConfig() ? "connected" : null);
   const importRef = useRef(null);
 
-  const apply = () => { const mr=parseNum(local.marginRateStr)/100; const ty=parseNum(local.targetYieldStr)/100; if(mr>0&&mr<1&&ty>0&&ty<2)setSettings(s=>({...s,marginRate:mr,targetYield:ty,yieldMode:local.yieldMode})); };
+  const [saveMsg, setSaveMsg] = useState(null);
+  const apply = () => {
+    const mr=parseNum(local.marginRateStr)/100;
+    const ty=parseNum(local.targetYieldStr)/100;
+    if(mr<=0||mr>=1){setSaveMsg({ok:false,text:"Margin rate must be between 0% and 100%."});return;}
+    if(ty<=0||ty>=2){setSaveMsg({ok:false,text:"Yield must be between 0% and 200%."});return;}
+    setSettings(s=>({...s,marginRate:mr,targetYield:ty,yieldMode:local.yieldMode}));
+    setSaveMsg({ok:true,text:"Settings saved."});
+    setTimeout(()=>setSaveMsg(null),3000);
+  };
 
   const connectSupabase = () => {
     if (!sbUrl.includes("supabase.co") || sbKey.length < 20) { setSbStatus("error"); return; }
@@ -1908,9 +1933,10 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
           ))}
         </div>
       </Card>
-      <div style={{display:"flex",gap:12,alignItems:"center"}}>
+      <div style={{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
         <button onClick={apply} style={{padding:"11px 28px",background:T.text,color:"#fff",border:"none",borderRadius:T.radiusXs,fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>Save Settings</button>
-        <button onClick={()=>{setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0"});setSettings(DEFAULT_SETTINGS);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
+        <button onClick={()=>{setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0"});setSettings(DEFAULT_SETTINGS);setSaveMsg({ok:true,text:"Reset to defaults."});setTimeout(()=>setSaveMsg(null),3000);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
+        {saveMsg&&<span style={{fontSize:12,fontWeight:600,color:saveMsg.ok?T.green:T.red}}>{saveMsg.ok?"✓":""} {saveMsg.text}</span>}
       </div>
 
       {/* ── EXPORT / IMPORT ── */}
@@ -2023,7 +2049,7 @@ function HelpPage() {
 function QuickCheckModal({ onClose, latest, settings }) {
   const [qGross,setQGross]=useState(""); const [qMargin,setQMargin]=useState(""); const [result,setResult]=useState(null);
   const eqColor=(eq)=>eq>=0.60?T.green:eq>=0.55?T.amber:T.red;
-  const check=()=>{const g=parseNum(qGross),m=parseNum(qMargin);if(!g)return;const equity=(g-m)/g;const divs=g*settings.effectiveYield/12;setResult({equity,divs,change:latest?equity-latest.equity:null});};
+  const check=()=>{const g=parseNum(qGross),m=parseNum(qMargin);if(!g)return;const equity=(g-m)/g;const divs=g*settings.effectiveYield/12;setResult({equity,divs,change:latest?equity-latest.equity:null,isHoldings:latest?.fromHoldings||false});};
   return(
     <div style={{position:"fixed",inset:0,background:"rgba(28,25,23,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:50,padding:16,backdropFilter:"blur(4px)"}} onClick={onClose}>
       <div style={{background:T.surface,borderRadius:T.radius,boxShadow:T.shadowHover,padding:28,width:380,maxWidth:"100%"}} onClick={e=>e.stopPropagation()}>
@@ -2036,7 +2062,7 @@ function QuickCheckModal({ onClose, latest, settings }) {
         <button onClick={check} style={{width:"100%",background:T.text,color:"#fff",border:"none",borderRadius:T.radiusXs,padding:"11px",fontFamily:"inherit",fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:result?16:0}}>Calculate</button>
         {result&&(<div style={{background:T.surfaceAlt,borderRadius:T.radiusSm,padding:16,border:`1px solid ${T.border}`}}>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:12}}>
-            <div><div style={{fontSize:10,color:T.textMuted,fontWeight:600,marginBottom:4}}>CURRENT EQUITY</div><div style={{fontSize:32,fontWeight:700,color:eqColor(result.equity),fontFamily:"'Lora', serif"}}>{fmtPct(result.equity)}</div>{result.change!==null&&<div style={{fontSize:11,color:result.change>=0?T.green:T.red,marginTop:4}}>{result.change>=0?"▲ +":"▼ "}{fmtPct(result.change,1)} vs last log</div>}</div>
+            <div><div style={{fontSize:10,color:T.textMuted,fontWeight:600,marginBottom:4}}>CURRENT EQUITY</div><div style={{fontSize:32,fontWeight:700,color:eqColor(result.equity),fontFamily:"'Lora', serif"}}>{fmtPct(result.equity)}</div>{result.change!==null&&<div style={{fontSize:11,color:result.change>=0?T.green:T.red,marginTop:4}}>{result.change>=0?"▲ +":"▼ "}{fmtPct(result.change,1)} vs {result.isHoldings?"holdings snapshot":"last log"}</div>}</div>
             <div><div style={{fontSize:10,color:T.textMuted,fontWeight:600,marginBottom:4}}>STATUS</div><div style={{fontSize:13,fontWeight:700,color:eqColor(result.equity),marginTop:8}}>{result.equity>=0.60?"✓ Above trigger":result.equity>=0.55?"⚠ Caution zone":"✗ Below floor"}</div><div style={{fontSize:11,color:T.textMuted,marginTop:6}}>Est. {fmt$(result.divs)}/mo divs</div></div>
           </div>
           <div style={{fontSize:11,color:T.textMuted,padding:"8px 12px",background:T.surface,borderRadius:T.radiusXs}}>Snapshot only — not saved. Log officially on the 1st.</div>
@@ -2053,7 +2079,7 @@ export default function App() {
   const [settings, setSettingsState] = useState(DEFAULT_SETTINGS);
   const [billItems, setBillItems] = useState([]);
   const [holdingSnapshots, setHoldingSnapshots] = useState([]);
-  const [form, setForm] = useState({ gross:"", margin:"", w2:"871", bills:"801", actualDivs:"", actualInterest:"", date:new Date().toISOString().slice(0,7) });
+  const [form, setForm] = useState({ gross:"", margin:"", w2:"", bills:"", actualDivs:"", actualInterest:"", date:new Date().toISOString().slice(0,7) });
   const [nextBill, setNextBill] = useState("200");
   const [showAdd, setShowAdd] = useState(false);
   const [editIdx, setEditIdx] = useState(null);
@@ -2469,7 +2495,7 @@ export default function App() {
         {activeTab==="stress"&&<StressTestTab latest={currentSnapshot} settings={fullSettings} positions={latestHoldings?.positions||null}/>}
 
         {activeTab==="metrics"&&(
-          <div>{!latest?<Card><div style={{textAlign:"center",padding:48,color:T.textMuted}}>Log your first month to see metrics.</div></Card>:(
+          <div>{!currentSnapshot?<Card><div style={{textAlign:"center",padding:48,color:T.textMuted}}>Log your first month to see metrics.</div></Card>:(
             <div style={{display:"flex",flexDirection:"column",gap:20}}>
               <Card>
                 <SectionLabel>DIVIDEND SNOWBALL</SectionLabel>
@@ -2485,14 +2511,67 @@ export default function App() {
                   ))}
                 </div>
               </Card>
+              {/* Data source badge for metrics summary */}
+              {currentSnapshot.fromHoldings&&(
+                <div style={{padding:"8px 14px",background:T.indigoBg,border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusSm,fontSize:11,color:T.indigo,fontWeight:600}}>
+                  📊 Summary metrics using current holdings data ({fmtTS(currentSnapshot.holdingsDate).split(",")[0]})
+                </div>
+              )}
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:20}}>
                 {[
-                  {title:"PORTFOLIO YIELD",main:fmtPct(latest.actualYield,1),mainColor:latest.actualYield>=0.20?T.green:T.amber,sub:"blended annual yield",rows:[{l:"Target",v:fmtPct(effectiveYield,1),c:T.textSub},{l:"Actual",v:fmtPct(latest.actualYield,1),c:latest.actualYield>=effectiveYield*0.95?T.green:T.amber},{l:"Holdings yield",v:holdingsYield?fmtPct(holdingsYield,1):"—",c:T.indigo}]},
-                  {title:"MARGIN EFFICIENCY",main:(effectiveYield/settings.marginRate).toFixed(2)+"x",mainColor:T.indigo,sub:"yield ÷ margin rate",rows:[{l:"Yield",v:fmtPct(effectiveYield,1),c:T.green},{l:"Rate",v:fmtPct(settings.marginRate,2),c:T.red},{l:"Net spread",v:"+"+fmtPct(effectiveYield-settings.marginRate,1),c:T.green}]},
-                  {title:"EQUITY MOMENTUM",main:equityMomAvg!==null?(equityMomAvg>0?"+":"")+fmtPct(equityMomAvg,1)+"/mo":"—",mainColor:equityMomAvg!==null?(equityMomAvg>0?T.green:T.red):T.textMuted,sub:"3-month average",rows:[{l:"Status",v:cond1?"Above trigger ✓":monthsToTrigger?`~${monthsToTrigger}mo to trigger`:"Below trigger",c:cond1?T.green:T.amber}]},
-                  {title:"MONTHLY INTEREST",main:fmt$(latest.effectiveInterest),mainColor:T.red,sub:latest.actualInterest!==null?"actual from statement":`est. at ${fmtPct(settings.marginRate,2)}`,rows:[{l:"Estimated",v:fmt$(latest.estimatedInterest),c:T.textSub},{l:"Actual",v:latest.actualInterest!==null?fmt$(latest.actualInterest):"Not logged",c:latest.actualInterest!==null?T.red:T.textMuted},{l:"Annual cost",v:fmt$(latest.effectiveInterest*12),c:T.red}]},
-                  {title:"TRUE NET DRAW",main:fmt$(latest.trueNetDraw),mainColor:latest.trueNetDraw>0?T.red:T.green,sub:"bills + interest − dividends",rows:[{l:"Bills",v:"-"+fmt$(latest.bills),c:T.red},{l:"Interest",v:"-"+fmt$(latest.effectiveInterest),c:T.red},{l:"Dividends",v:"+"+fmt$(latest.effectiveDivs),c:T.green}]},
-                  {title:"MILESTONES",main:fmt$(totalDivsReceived),mainColor:T.green,sub:"all-time dividends",rows:[{l:"Freedom Date",v:freedomDate||"—",c:T.indigo},{l:"Bills covered",v:fmtPct(latest.coverage,1),c:latest.coverage>=1?T.green:T.amber}]},
+                  {title:"PORTFOLIO YIELD",
+                    main:fmtPct(currentSnapshot.actualYield||effectiveYield,1),
+                    mainColor:(currentSnapshot.actualYield||effectiveYield)>=0.20?T.green:T.amber,
+                    sub:"blended annual yield",
+                    rows:[
+                      {l:"Target",v:fmtPct(effectiveYield,1),c:T.textSub},
+                      {l:"Effective",v:fmtPct(currentSnapshot.actualYield||effectiveYield,1),c:T.green},
+                      {l:"Holdings yield",v:holdingsYield?fmtPct(holdingsYield,1):"—",c:T.indigo},
+                    ]},
+                  {title:"MARGIN EFFICIENCY",
+                    main:(effectiveYield/settings.marginRate).toFixed(2)+"x",
+                    mainColor:T.indigo,
+                    sub:"yield ÷ margin rate",
+                    rows:[
+                      {l:"Yield",v:fmtPct(effectiveYield,1),c:T.green},
+                      {l:"Rate",v:fmtPct(settings.marginRate,2),c:T.red},
+                      {l:"Net spread",v:"+"+fmtPct(effectiveYield-settings.marginRate,1),c:T.green},
+                    ]},
+                  {title:"EQUITY MOMENTUM",
+                    main:equityMomAvg!==null?(equityMomAvg>0?"+":"")+fmtPct(equityMomAvg,1)+"/mo":"—",
+                    mainColor:equityMomAvg!==null?(equityMomAvg>0?T.green:T.red):T.textMuted,
+                    sub:"3-month avg from log history",
+                    rows:[
+                      {l:"Current equity",v:fmtPct(currentSnapshot.equity),c:eqColor(currentSnapshot.equity)},
+                      {l:"Status",v:cond1?"Above trigger ✓":monthsToTrigger?`~${monthsToTrigger}mo to trigger`:"Below trigger",c:cond1?T.green:T.amber},
+                    ]},
+                  {title:"MONTHLY INTEREST",
+                    main:fmt$(currentSnapshot.effectiveInterest),
+                    mainColor:T.red,
+                    sub:latest?.actualInterest!=null?"actual from statement":`est. at ${fmtPct(settings.marginRate,2)}`,
+                    rows:[
+                      {l:"Estimated",v:fmt$(currentSnapshot.estimatedInterest),c:T.textSub},
+                      {l:"Actual (last log)",v:latest?.actualInterest!=null?fmt$(latest.actualInterest):"Not logged",c:latest?.actualInterest!=null?T.red:T.textMuted},
+                      {l:"Annual cost",v:fmt$(currentSnapshot.effectiveInterest*12),c:T.red},
+                    ]},
+                  {title:"TRUE NET DRAW",
+                    main:fmt$(currentSnapshot.trueNetDraw),
+                    mainColor:currentSnapshot.trueNetDraw>0?T.red:T.green,
+                    sub:"bills + interest − dividends",
+                    rows:[
+                      {l:"Bills",v:"−"+fmt$(currentSnapshot.bills),c:T.red},
+                      {l:"Interest",v:"−"+fmt$(currentSnapshot.effectiveInterest),c:T.red},
+                      {l:"Dividends",v:"+"+fmt$(currentSnapshot.effectiveDivs),c:T.green},
+                    ]},
+                  {title:"MILESTONES",
+                    main:fmt$(totalDivsReceived),
+                    mainColor:T.green,
+                    sub:"all-time dividends",
+                    rows:[
+                      {l:"Freedom Date",v:freedomDate||"—",c:T.indigo},
+                      {l:"Bills covered",v:fmtPct(currentSnapshot.coverage,1),c:currentSnapshot.coverage>=1?T.green:T.amber},
+                      {l:"Avail. to withdraw",v:fmt$(currentSnapshot.availableToWithdraw||0),c:(currentSnapshot.availableToWithdraw||0)>500?T.green:T.amber},
+                    ]},
                 ].map(({title,main,mainColor,sub,rows})=>(
                   <Card key={title}>
                     <SectionLabel>{title}</SectionLabel>
@@ -2512,7 +2591,7 @@ export default function App() {
             {computed.length===0?(<div style={{textAlign:"center",padding:48,color:T.textMuted}}>No entries yet.</div>):(
               <div style={{overflowX:"auto"}}>
                 <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                  <thead><tr style={{borderBottom:`2px solid ${T.border}`}}>{["Date","Gross","Margin","Net","Equity","Divs/Mo","Div Type","Interest","Int Type","Net Draw","Coverage",""].map(h=><th key={h} style={{padding:"8px 10px",textAlign:"left",fontSize:10,fontWeight:700,letterSpacing:"1px",color:T.textMuted}}>{h}</th>)}</tr></thead>
+                  <thead><tr style={{borderBottom:`2px solid ${T.border}`}}>{["Date","Gross","Margin","Net","Equity","Deposits/Mo","Bills/Mo","Divs/Mo","Div Type","Interest","Int Type","Net Draw","Coverage",""].map(h=><th key={h} style={{padding:"8px 10px",textAlign:"left",fontSize:10,fontWeight:700,letterSpacing:"1px",color:T.textMuted,whiteSpace:"nowrap"}}>{h}</th>)}</tr></thead>
                   <tbody>
                     {computed.map((e,i)=>(
                       <tr key={i} style={{borderBottom:`1px solid ${T.borderLight}`}} onMouseEnter={ev=>ev.currentTarget.style.background=T.surfaceAlt} onMouseLeave={ev=>ev.currentTarget.style.background="transparent"}>
@@ -2521,6 +2600,8 @@ export default function App() {
                         <td style={{padding:"11px 10px"}}>{fmt$(e.margin)}</td>
                         <td style={{padding:"11px 10px",fontWeight:600}}>{fmt$(e.gross-e.margin)}</td>
                         <td style={{padding:"11px 10px"}}><span style={{fontWeight:700,color:eqColor(e.equity)}}>{fmtPct(e.equity)}</span>{e.rising!==null&&<span style={{marginLeft:6,fontSize:10,fontWeight:700,color:e.rising?T.green:T.red}}>{e.rising?"▲":"▼"}</span>}</td>
+                        <td style={{padding:"11px 10px",color:T.indigo,fontWeight:600}}>{fmt$(e.w2,0)}</td>
+                        <td style={{padding:"11px 10px",color:T.red,fontWeight:600}}>{fmt$(e.bills,0)}</td>
                         <td style={{padding:"11px 10px",color:T.green,fontWeight:600}}>{fmt$(e.effectiveDivs)}{e.divGrowth!==null&&<span style={{fontSize:10,color:e.divGrowth>=0?T.green:T.red,marginLeft:4}}>{e.divGrowth>=0?"+":""}{fmt$(e.divGrowth)}</span>}</td>
                         <td style={{padding:"11px 10px"}}><span style={{fontSize:9,fontWeight:700,padding:"2px 6px",borderRadius:20,background:e.actualDivs!==null?T.greenBg:T.amberBg,color:e.actualDivs!==null?T.green:T.amber,border:`1px solid ${e.actualDivs!==null?T.greenBorder:T.amberBorder}`}}>{e.actualDivs!==null?"ACT":"EST"}</span></td>
                         <td style={{padding:"11px 10px",color:T.red,fontWeight:600}}>{fmt$(e.effectiveInterest)}</td>
