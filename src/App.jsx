@@ -175,6 +175,142 @@ function movingAverage(values, window) {
   return values.map((_, i) => { if (i < window - 1) return null; const s = values.slice(i - window + 1, i + 1); return s.reduce((a, b) => a + b, 0) / window; });
 }
 
+// ── MAINTENANCE REQUIREMENTS ───────────────────────────────────────────────────
+// E-Trade position-specific maintenance requirements (house requirements, not just Reg T).
+// These are the percentages E-Trade uses to calculate margin calls and Available to Withdraw.
+// Sources: E-Trade Margin Handbook, published house requirements, and known broker policies.
+// A 50% requirement means E-Trade requires you to maintain equity equal to 50% of that
+// position's value at all times. Standard Reg T minimum is 25%, but E-Trade applies
+// higher house requirements to volatile, leveraged, and options-income securities.
+const MAINTENANCE_MAP = {
+  // ── B1 GROWTH ANCHORS ─────────────────────────────────────────────────────────
+  // Broad index ETFs — standard 25%
+  SPY:   0.25, VOO:   0.25, QQQ:   0.25, SPYG:  0.25, VGT:  0.25,
+  XAR:   0.25, AAAU:  0.25,
+  // Large-cap blue chip stocks — 30%
+  AAPL:  0.30, MSFT:  0.30, AMZN:  0.30, GOOG:  0.30, GOOGL: 0.30,
+  NVDA:  0.30, COST:  0.30, MCD:   0.30,
+  "BRK.B": 0.30, BRKB: 0.30, BRKA: 0.30,
+  // Mid/small cap or more volatile — 35%
+  KGC:   0.35, PARR:  0.35, ARKK:  0.35,
+  // Highly volatile individual stocks — 50%
+  MSTR:  0.50,
+  // Leveraged ETFs — dramatically higher (E-Trade standard policy)
+  TQQQ:  0.90,  // 3× Nasdaq-100 — E-Trade house requirement 90%
+  SQQQ:  0.90,  // 3× inverse
+  UPRO:  0.90,  // 3× S&P 500
+  SSO:   0.75,  // 2× S&P 500
+  QLD:   0.75,  // 2× QQQ
+  BITX:  0.75,  // 2× Bitcoin — leveraged crypto
+
+  // ── B2 CEF COMPOUNDERS ────────────────────────────────────────────────────────
+  // Closed-End Funds — typically 30%
+  CLM:   0.30, CRF:   0.30, GOF:   0.30, ECAT:  0.30,
+  PTY:   0.30, PCI:   0.30, PDI:   0.30, RFI:   0.30,
+  UTF:   0.30, UTG:   0.30,
+  QQQH:  0.30, XQQI:  0.30,
+
+  // ── B3 HIGH-YIELD WORKHORSES ──────────────────────────────────────────────────
+  // Broad-index options income ETFs — 30-35%
+  SPYI:  0.30,  // S&P 500 covered calls — relatively stable index
+  QQQI:  0.35,  // QQQ options income
+  IWMY:  0.40,  // IWM weekly options — small cap, more volatile
+
+  // 0DTE / weekly options strategy ETFs — 50%
+  // These hold cash + sell 0DTE options. E-Trade applies 50% house requirement.
+  XDTE:  0.50,  // S&P 500 0DTE
+  QDTE:  0.50,  // QQQ 0DTE
+  RDTE:  0.50,  // Russell 2000 0DTE
+  WDTE:  0.50,  // Weekly options strategy
+
+  // QQQ-focused options income — 50%
+  QQQY:  0.50,  // Defiance QQQ options income
+
+  // Single-stock options income ETFs — elevated due to single-stock volatility
+  NVDY:  0.55,  // NVDA options (NVDA extremely volatile)
+  TSLY:  0.60,  // TSLA options (TSLA extremely volatile)
+  MSTY:  0.65,  // MicroStrategy options (MSTR + crypto exposure — highest)
+  AMZY:  0.55,  // AMZN options
+  GOOGY: 0.55,  // GOOG options
+  PLTY:  0.65,  // PLTR options (highly speculative)
+  CONY:  0.55,  // COIN options (crypto-adjacent)
+  APLY:  0.55,  // AAPL options
+  YMAG:  0.50,  // YieldMax Mag7 basket
+
+  // Other high-yield / specialty
+  BRKW:  0.50,  // Weekly BRK options
+  HOOY:  0.50,  // High-yield options strategy
+  WPAY:  0.50,  // Weekly pay options
+  YMAX:  0.50,  // YieldMax universe ETF
+  ULTY:  0.60,  // Ultra-high income (complex, volatile)
+  USOY:  0.50,  // US Oil options income
+  BTCI:  0.65,  // Bitcoin options income (crypto exposure)
+  TSII:  0.55,  // Single-stock options income
+
+  // REITs — 30%
+  O:     0.30,
+
+  // Commodity-linked — 35%
+  IAUI:  0.35,  // Gold-related
+  KSLV:  0.35,  // Silver-related
+};
+
+const DEFAULT_MAINTENANCE_REQ = 0.30; // Conservative fallback for unknown tickers
+
+function getMaintenanceReq(ticker, override) {
+  if (override !== null && override !== undefined) return override;
+  return MAINTENANCE_MAP[ticker?.toUpperCase()] ?? DEFAULT_MAINTENANCE_REQ;
+}
+
+// Returns the weighted blended maintenance rate for a portfolio of positions.
+// This is what drives E-Trade's actual margin call math, not Reg T's flat 25%.
+function calcWeightedMaintenanceRate(positions) {
+  if (!positions || !positions.length) return DEFAULT_MAINTENANCE_REQ;
+  const totalMV = positions.reduce((s, p) => s + (p.marketValue || 0), 0);
+  if (totalMV <= 0) return DEFAULT_MAINTENANCE_REQ;
+  const weightedSum = positions.reduce((s, p) => {
+    const req = getMaintenanceReq(p.ticker, p.maintenanceReq ?? null);
+    return s + (p.marketValue || 0) * req;
+  }, 0);
+  return weightedSum / totalMV;
+}
+
+// Returns the maintenance requirement in dollars given current positions.
+function calcMaintenanceDollars(positions) {
+  if (!positions || !positions.length) return 0;
+  return positions.reduce((s, p) => {
+    const req = getMaintenanceReq(p.ticker, p.maintenanceReq ?? null);
+    return s + (p.marketValue || 0) * req;
+  }, 0);
+}
+
+// Returns the true margin call drop percentage using position-level maintenance.
+// Math: when market drops X%, each position drops by (1-X), so maintenance dollars
+// also scale by (1-X). Margin call occurs when:
+//   gross*(1-X) - margin = maintenanceDollars*(1-X)
+//   (1-X)*(gross - maintenanceDollars) = margin
+//   X = 1 - margin/(gross - maintenanceDollars)
+// Falls back to flat 25% if no position data.
+function calcTrueMarginCallDrop(gross, margin, positions) {
+  if (!margin || margin <= 0) return Infinity;
+  if (!positions || !positions.length) return criticalDropPct(gross, margin, 0.25);
+  const maintenanceDollars = calcMaintenanceDollars(positions);
+  const denominator = gross - maintenanceDollars;
+  if (denominator <= 0) return 0;
+  const X = 1 - margin / denominator;
+  if (X <= 0) return 0;
+  return X * 100;
+}
+
+// Available to Withdraw = max(0, Equity - MaintenanceRequirement$)
+// This matches what E-Trade shows in their account balances section.
+function calcAvailableToWithdraw(gross, margin, positions) {
+  const equity = gross - margin;
+  if (!positions || !positions.length) return Math.max(0, equity - gross * 0.25);
+  const maintenanceDollars = calcMaintenanceDollars(positions);
+  return Math.max(0, equity - maintenanceDollars);
+}
+
 // ── DESIGN TOKENS ─────────────────────────────────────────────────────────────
 const T = {
   bg: "#FAF9F6", surface: "#FFFFFF", surfaceAlt: "#F7F6F3",
@@ -190,13 +326,6 @@ const T = {
   shadow: "0 1px 3px rgba(28,25,23,0.04), 0 4px 20px rgba(28,25,23,0.07)",
   shadowHover: "0 2px 8px rgba(28,25,23,0.07), 0 12px 32px rgba(28,25,23,0.1)",
   radius: "16px", radiusSm: "10px", radiusXs: "6px",
-};
-
-const ASSET_CLASS_COLORS = {
-  "Equities":              { color: T.blue,   bg: T.blueBg,   border: T.blueBorder },
-  "Fixed Income & Pref":   { color: T.violet, bg: T.violetBg, border: T.violetBorder },
-  "Alternatives":          { color: T.amber,  bg: T.amberBg,  border: T.amberBorder },
-  "Cash":                  { color: T.textSub,bg: T.surfaceAlt,border: T.border },
 };
 
 const CATS = {
@@ -222,15 +351,26 @@ const SectionLabel = ({ children, action }) => (
     {action}
   </div>
 );
-const StatTile = ({ label, value, sub, color, serif, size = 22, badge }) => (
-  <div style={{ background: T.surfaceAlt, borderRadius: T.radiusSm, padding: "14px 16px", border: `1px solid ${T.borderLight}` }}>
-    <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "1.2px", color: T.textMuted, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
-      {label}{badge && <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 20, background: badge === "ACTUAL" ? T.greenBg : T.amberBg, color: badge === "ACTUAL" ? T.green : T.amber, border: `1px solid ${badge === "ACTUAL" ? T.greenBorder : T.amberBorder}` }}>{badge}</span>}
+const StatTile = ({ label, value, sub, color, serif, size = 22, badge }) => {
+  const badgeStyle = (() => {
+    if (!badge) return null;
+    if (badge === "ACTUAL") return { bg: T.greenBg, color: T.green, border: T.greenBorder };
+    if (badge === "HOLDINGS") return { bg: T.indigoBg, color: T.indigo, border: T.indigoBorder };
+    if (badge === "E-TRADE") return { bg: T.indigoBg, color: T.indigo, border: T.indigoBorder };
+    if (badge === "FROM LOG") return { bg: T.amberBg, color: T.amber, border: T.amberBorder };
+    // default (EST, etc.)
+    return { bg: T.amberBg, color: T.amber, border: T.amberBorder };
+  })();
+  return (
+    <div style={{ background: T.surfaceAlt, borderRadius: T.radiusSm, padding: "14px 16px", border: `1px solid ${T.borderLight}` }}>
+      <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "1.2px", color: T.textMuted, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+        {label}{badgeStyle && <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 20, background: badgeStyle.bg, color: badgeStyle.color, border: `1px solid ${badgeStyle.border}` }}>{badge}</span>}
+      </div>
+      <div style={{ fontSize: size, fontWeight: 700, color: color || T.text, fontFamily: serif ? "'Lora', serif" : "inherit", lineHeight: 1.1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}>{sub}</div>}
     </div>
-    <div style={{ fontSize: size, fontWeight: 700, color: color || T.text, fontFamily: serif ? "'Lora', serif" : "inherit", lineHeight: 1.1 }}>{value}</div>
-    {sub && <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}>{sub}</div>}
-  </div>
-);
+  );
+};
 const Badge = ({ children, color, bg, border }) => (
   <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 20, background: bg, color, border: `1px solid ${border}`, letterSpacing: "0.5px" }}>{children}</span>
 );
@@ -824,8 +964,9 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
   const csvNeedsMargin = latest?.marginLoan === null || latest?.marginLoan === undefined;
 
   const saveMarginEntry = () => {
+    if (!marginEntry.trim()) return; // don't silently save $0 on empty input
     const m = parseNum(marginEntry);
-    if (!latest || isNaN(m) || m < 0) return;
+    if (!latest || m < 0) return;
     const updated = holdingSnapshots.map(s =>
       s.id === latest.id ? { ...s, marginLoan: m, netValue: s.totalAssets - m } : s
     );
@@ -862,6 +1003,23 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
     const updated = holdingSnapshots.map(s => {
       if (s.id !== latest.id) return s;
       return { ...s, positions: s.positions.map(p => p.ticker === ticker ? { ...p, bucket: newBucket } : p) };
+    });
+    setHoldingSnapshots(updated); saveHoldings(updated);
+  };
+
+  // Let user override maintenance requirement for a position
+  const updateMaintenanceReq = (ticker, newReq) => {
+    if (!latest) return;
+    const updated = holdingSnapshots.map(s => {
+      if (s.id !== latest.id) return s;
+      return {
+        ...s,
+        positions: s.positions.map(p =>
+          p.ticker === ticker
+            ? { ...p, maintenanceReq: newReq === null ? undefined : newReq }
+            : p
+        ),
+      };
     });
     setHoldingSnapshots(updated); saveHoldings(updated);
   };
@@ -985,13 +1143,17 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
 
           {/* Key metrics row */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr", gap: 14 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr 1fr", gap: 14 }}>
             {[
               { l: "TOTAL ASSETS", v: fmt$(latest.totalAssets || 0), c: T.text },
               { l: "MARGIN LOAN", v: fmt$(latest.marginLoan || 0), c: T.red },
               { l: "NET VALUE", v: fmt$(latest.netValue || 0), c: T.green },
               { l: "BLENDED YIELD", v: holdingsBlendedYield ? fmtPct(holdingsBlendedYield, 1) : "—", c: T.indigo, badge: "ACTUAL" },
               { l: "EST. ANNUAL INCOME", v: fmt$(latest.totalEstAnnIncome || 0, 0), c: T.green },
+              { l: "WTDAVG MAINT. REQ.", v: fmtPct(calcWeightedMaintenanceRate(latest.positions), 1),
+                c: calcWeightedMaintenanceRate(latest.positions) > 0.40 ? T.red
+                  : calcWeightedMaintenanceRate(latest.positions) > 0.30 ? T.amber : T.green,
+                badge: "E-TRADE" },
             ].map(({ l, v, c, badge }) => (
               <Card key={l} style={{ padding: "14px 16px" }}>
                 <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "1.2px", color: T.textMuted, marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
@@ -1081,12 +1243,16 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
                     <SortHeader col="unrealizedGL">G/L $</SortHeader>
                     <SortHeader col="estAnnIncome">ANN INC</SortHeader>
                     <SortHeader col="currentYield">YIELD %</SortHeader>
+                    <th style={{ padding: "8px 10px", textAlign: "right", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.textMuted }}>MAINT %</th>
                     <th style={{ padding: "8px 10px", textAlign: "left", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.textMuted }}>BUCKET</th>
                   </tr>
                 </thead>
                 <tbody>
                   {positions.map((p, i) => {
                     const bk = BUCKET_LABELS[p.bucket || "Unassigned"] || BUCKET_LABELS.Unassigned;
+                    const maintReq = getMaintenanceReq(p.ticker, p.maintenanceReq ?? null);
+                    const isOverride = p.maintenanceReq !== null && p.maintenanceReq !== undefined;
+                    const maintColor = maintReq >= 0.60 ? T.rose : maintReq >= 0.50 ? T.red : maintReq >= 0.40 ? T.amber : maintReq >= 0.30 ? T.textSub : T.green;
                     return (
                       <tr key={i} style={{ borderBottom: `1px solid ${T.borderLight}` }}
                         onMouseEnter={ev => ev.currentTarget.style.background = T.surfaceAlt}
@@ -1102,6 +1268,46 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
                         <td style={{ padding: "10px 10px", textAlign: "right", color: T.green }}>{fmt$(p.estAnnIncome || 0)}</td>
                         <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: (p.currentYield || 0) > 20 ? T.green : T.indigo }}>
                           {(p.currentYield || 0).toFixed(2)}%
+                        </td>
+                        {/* Maintenance Req — clickable to override */}
+                        <td style={{ padding: "10px 10px", textAlign: "right", position: "relative" }}>
+                          <button
+                            onClick={() => setOpenPicker(openPicker === `maint-${p.ticker}` ? null : `maint-${p.ticker}`)}
+                            title={isOverride ? "Custom override — click to edit" : "E-Trade default — click to override"}
+                            style={{ fontSize: 11, fontWeight: 700, color: maintColor, background: "transparent", border: `1px solid ${isOverride ? maintColor : T.borderLight}`, borderRadius: T.radiusXs, padding: "2px 8px", cursor: "pointer", fontFamily: "'Lora', serif" }}>
+                            {fmtPct(maintReq, 0)}{isOverride ? " ✎" : ""}
+                          </button>
+                          {openPicker === `maint-${p.ticker}` && (
+                            <div style={{ position: "absolute", top: "100%", right: 0, background: T.surface, border: `1px solid ${T.border}`, borderRadius: T.radiusSm, boxShadow: T.shadowHover, zIndex: 10, padding: 12, minWidth: 220 }}>
+                              <div style={{ fontSize: 11, fontWeight: 700, color: T.text, marginBottom: 6 }}>{p.ticker} — Maintenance Override</div>
+                              <div style={{ fontSize: 10, color: T.textMuted, marginBottom: 8, lineHeight: 1.5 }}>
+                                Default: {fmtPct(MAINTENANCE_MAP[p.ticker?.toUpperCase()] ?? DEFAULT_MAINTENANCE_REQ, 0)}<br/>
+                                Set a custom % if E-Trade has changed this requirement.
+                              </div>
+                              <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8 }}>
+                                <input
+                                  defaultValue={(maintReq * 100).toFixed(0)}
+                                  id={`maint-input-${p.ticker}`}
+                                  style={{ width: 70, padding: "6px 8px", background: T.surfaceAlt, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, fontSize: 13, fontWeight: 700, color: T.text, fontFamily: "inherit", outline: "none", textAlign: "right" }}
+                                />
+                                <span style={{ fontSize: 12, color: T.textMuted }}>%</span>
+                              </div>
+                              <div style={{ display: "flex", gap: 6 }}>
+                                <button onClick={() => {
+                                  const val = parseFloat(document.getElementById(`maint-input-${p.ticker}`)?.value);
+                                  if (!isNaN(val) && val > 0 && val <= 100) {
+                                    updateMaintenanceReq(p.ticker, val / 100);
+                                  }
+                                  setOpenPicker(null);
+                                }} style={{ flex: 1, padding: "6px", background: T.text, color: "#fff", border: "none", borderRadius: T.radiusXs, fontSize: 11, fontWeight: 700, fontFamily: "inherit", cursor: "pointer" }}>Save</button>
+                                {isOverride && (
+                                  <button onClick={() => { updateMaintenanceReq(p.ticker, null); setOpenPicker(null); }}
+                                    style={{ padding: "6px 10px", background: T.redBg, color: T.red, border: `1px solid ${T.redBorder}`, borderRadius: T.radiusXs, fontSize: 11, fontFamily: "inherit", cursor: "pointer" }}>Reset</button>
+                                )}
+                                <button onClick={() => setOpenPicker(null)} style={{ padding: "6px 10px", background: "transparent", color: T.textMuted, border: `1px solid ${T.border}`, borderRadius: T.radiusXs, fontSize: 11, fontFamily: "inherit", cursor: "pointer" }}>Cancel</button>
+                              </div>
+                            </div>
+                          )}
                         </td>
                         <td style={{ padding: "10px 10px", position: "relative" }}>
                           <button onClick={() => setOpenPicker(openPicker === p.ticker ? null : p.ticker)}
@@ -1139,6 +1345,9 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings }) {
                     <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: T.green }}>{fmt$(positions.reduce((s, p) => s + (p.estAnnIncome || 0), 0))}</td>
                     <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: T.indigo }}>
                       {positions.reduce((s, p) => s + (p.marketValue || 0), 0) > 0 ? fmtPct(positions.reduce((s, p) => s + (p.estAnnIncome || 0), 0) / positions.reduce((s, p) => s + (p.marketValue || 0), 0), 1) : "—"}
+                    </td>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: calcWeightedMaintenanceRate(positions) > 0.40 ? T.red : calcWeightedMaintenanceRate(positions) > 0.30 ? T.amber : T.green }}>
+                      {fmtPct(calcWeightedMaintenanceRate(positions), 1)}
                     </td>
                     <td />
                   </tr>
@@ -1265,9 +1474,11 @@ function RecoveryChart({ postCrashGross, margin, divs, w2, bills, marginRate, yi
   );
 }
 
-function StressTestTab({ latest, settings }) {
+function StressTestTab({ latest, settings, positions }) {
   const [drawdown, setDrawdown] = useState(25);
   const [nextBillAmt, setNextBillAmt] = useState("200");
+  const [showMaintBreakdown, setShowMaintBreakdown] = useState(false);
+
   if (!latest) return (
     <Card><div style={{textAlign:"center",padding:48,color:T.textMuted}}>
       <div style={{fontSize:32,marginBottom:12}}>🛡️</div>
@@ -1275,36 +1486,211 @@ function StressTestTab({ latest, settings }) {
       <div style={{fontSize:12,lineHeight:1.7}}>The Stress Test needs your Monthly Deposits and Bills Floated amounts from a log entry to model recovery scenarios. Log one month first — if you've uploaded holdings, your current portfolio values will be used automatically.</div>
     </div></Card>
   );
+
   const {gross,margin,effectiveDivs:divs,w2,bills,equity:precrashEquity}=latest;
   const {marginRate,effectiveYield:yield_}=settings;
-  const d=drawdown/100; const postCrashGross=gross*(1-d); const postCrashEquity=margin>0?(postCrashGross-margin)/postCrashGross:1.0;
-  const postCrashDivs=postCrashGross*yield_/12; const dollarLoss=gross-postCrashGross;
-  const recoveryMonths=calcRecoveryMonths(postCrashGross,margin,postCrashDivs,w2,bills,marginRate,yield_,precrashEquity);
-  const drop60=criticalDropPct(gross,margin,0.60); const drop55=criticalDropPct(gross,margin,0.55); const dropCall25=criticalDropPct(gross,margin,0.25); const noMargin=!margin||margin<=0;
-  const eqStatus=(eq)=>{if(eq>=0.60)return{label:"Above trigger",color:T.green,bg:T.greenBg,border:T.greenBorder};if(eq>=0.55)return{label:"Caution zone",color:T.amber,bg:T.amberBg,border:T.amberBorder};if(eq>=0.25)return{label:"Below floor",color:T.red,bg:T.redBg,border:T.redBorder};return{label:"Margin call risk",color:T.rose,bg:T.roseBg,border:T.roseBorder};};
+  const hasPositions = positions && positions.length > 0;
+
+  // ── POSITION-AWARE MAINTENANCE CALCULATIONS ─────────────────────────────────
+  const weightedMaintRate  = calcWeightedMaintenanceRate(positions);
+  const maintenanceDollars = calcMaintenanceDollars(positions);
+  const trueMarginCallDrop = calcTrueMarginCallDrop(gross, margin, positions);
+  const availableToWithdraw= calcAvailableToWithdraw(gross, margin, positions);
+  const flatCallDrop       = criticalDropPct(gross, margin, 0.25); // old 25% estimate
+  const callDropDelta      = isFinite(trueMarginCallDrop) && isFinite(flatCallDrop)
+    ? flatCallDrop - trueMarginCallDrop : null; // positive = flat was optimistic
+
+  // ── CRASH SCENARIO ──────────────────────────────────────────────────────────
+  const d=drawdown/100;
+  const postCrashGross = gross*(1-d);
+  const postCrashEquity = margin>0 ? (postCrashGross-margin)/postCrashGross : 1.0;
+  const postCrashDivs  = postCrashGross*yield_/12;
+  const dollarLoss     = gross-postCrashGross;
+  const recoveryMonths = calcRecoveryMonths(postCrashGross,margin,postCrashDivs,w2,bills,marginRate,yield_,precrashEquity);
+
+  // Cushion calculations
+  const drop60    = criticalDropPct(gross,margin,0.60);
+  const drop55    = criticalDropPct(gross,margin,0.55);
+  const noMargin  = !margin||margin<=0;
+
+  const eqStatus=(eq)=>{
+    if(eq>=0.60) return{label:"Above trigger",color:T.green,bg:T.greenBg,border:T.greenBorder};
+    if(eq>=0.55) return{label:"Caution zone",color:T.amber,bg:T.amberBg,border:T.amberBorder};
+    if(eq>=weightedMaintRate) return{label:"Below floor",color:T.red,bg:T.redBg,border:T.redBorder};
+    return{label:"Margin call risk",color:T.rose,bg:T.roseBg,border:T.roseBorder};
+  };
   const status=eqStatus(postCrashEquity);
-  const CushionBar=({label,dropPct,color,bg,border})=>{const isInf=!isFinite(dropPct)||noMargin;const pct=isInf?100:Math.min(100,Math.max(0,dropPct));return(<div style={{marginBottom:18}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div style={{fontSize:12,fontWeight:600,color:T.text}}>{label}</div><div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:20,fontWeight:800,color,fontFamily:"'Lora', serif"}}>{isInf?"∞":`−${pct.toFixed(1)}%`}</span>{!isInf&&<span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:20,background:bg,color,border:`1px solid ${border}`}}>{pct>40?"Very Safe":pct>20?"Healthy":pct>10?"Watch":"Tight"}</span>}</div></div><div style={{height:8,background:T.borderLight,borderRadius:4,overflow:"hidden",position:"relative"}}><div style={{position:"absolute",inset:0,width:`${pct}%`,background:color,borderRadius:4,opacity:0.55,transition:"width 0.4s"}}/>{!isInf&&drawdown>0&&drawdown<100&&<div style={{position:"absolute",top:0,bottom:0,left:`${Math.min(drawdown,99)}%`,width:2,background:T.text,opacity:0.35}}/>}</div><div style={{fontSize:10,color:T.textMuted,marginTop:4}}>{isInf?"No margin — cannot reach this threshold through price drops alone":`Portfolio can absorb a ${pct.toFixed(1)}% drop before this line is crossed`}</div></div>);};
+
+  const CushionBar=({label,dropPct,color,bg,border,note})=>{
+    const isInf=!isFinite(dropPct)||noMargin;
+    const pct=isInf?100:Math.min(100,Math.max(0,dropPct));
+    return(
+      <div style={{marginBottom:18}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+          <div>
+            <div style={{fontSize:12,fontWeight:600,color:T.text}}>{label}</div>
+            {note&&<div style={{fontSize:10,color:T.textMuted,marginTop:1}}>{note}</div>}
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:20,fontWeight:800,color,fontFamily:"'Lora', serif"}}>{isInf?"∞":`−${pct.toFixed(1)}%`}</span>
+            {!isInf&&<span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:20,background:bg,color,border:`1px solid ${border}`}}>{pct>40?"Very Safe":pct>20?"Healthy":pct>10?"Watch":"Tight"}</span>}
+          </div>
+        </div>
+        <div style={{height:8,background:T.borderLight,borderRadius:4,overflow:"hidden",position:"relative"}}>
+          <div style={{position:"absolute",inset:0,width:`${pct}%`,background:color,borderRadius:4,opacity:0.55,transition:"width 0.4s"}}/>
+          {!isInf&&drawdown>0&&drawdown<100&&<div style={{position:"absolute",top:0,bottom:0,left:`${Math.min(drawdown,99)}%`,width:2,background:T.text,opacity:0.35}}/>}
+        </div>
+        <div style={{fontSize:10,color:T.textMuted,marginTop:4}}>
+          {isInf?"No margin — cannot reach this threshold through price drops alone":`Portfolio can absorb a ${pct.toFixed(1)}% drop before this line is crossed`}
+        </div>
+      </div>
+    );
+  };
+
+  // Top positions by maintenance burden for breakdown table
+  const maintBreakdown = hasPositions
+    ? [...positions]
+        .map(p=>({
+          ticker: p.ticker,
+          mv: p.marketValue||0,
+          req: getMaintenanceReq(p.ticker, p.maintenanceReq??null),
+          burden: (p.marketValue||0) * getMaintenanceReq(p.ticker, p.maintenanceReq??null),
+        }))
+        .sort((a,b)=>b.burden-a.burden)
+        .slice(0,12)
+    : [];
+
   const SCENARIOS=[5,10,15,20,25,30,40,50,60];
+
   return(
     <div style={{display:"flex",flexDirection:"column",gap:20}}>
+
+      {/* ── POSITION AWARENESS BANNER ── */}
+      {hasPositions?(
+        <div style={{background:T.indigoBg,border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusSm,padding:"12px 18px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:T.indigo,marginBottom:2}}>📊 Using position-level maintenance requirements — accurate E-Trade math</div>
+            <div style={{fontSize:11,color:T.textSub}}>Weighted blended maintenance rate: <strong style={{color:T.indigo}}>{fmtPct(weightedMaintRate,1)}</strong> · Available to Withdraw: <strong style={{color:T.indigo}}>{fmt$(availableToWithdraw)}</strong>{callDropDelta!==null&&callDropDelta>0.5&&<span style={{color:T.red}}> · Flat 25% estimate was <strong>{callDropDelta.toFixed(1)}% too optimistic</strong> on margin call</span>}</div>
+          </div>
+          <button onClick={()=>setShowMaintBreakdown(v=>!v)} style={{fontSize:11,fontWeight:700,color:T.indigo,background:"none",border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusXs,padding:"5px 12px",fontFamily:"inherit",cursor:"pointer",whiteSpace:"nowrap"}}>{showMaintBreakdown?"Hide":"Show"} Breakdown</button>
+        </div>
+      ):(
+        <div style={{background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusSm,padding:"10px 16px"}}>
+          <div style={{fontSize:11,color:T.amber,fontWeight:600}}>⚠ Upload a holdings snapshot for accurate position-level maintenance calculations. Currently using flat 25% Reg T minimum — your true margin call threshold is likely higher.</div>
+        </div>
+      )}
+
+      {/* ── MAINTENANCE BREAKDOWN ── */}
+      {showMaintBreakdown && hasPositions && (
+        <Card>
+          <SectionLabel>MAINTENANCE REQUIREMENT BREAKDOWN</SectionLabel>
+          <div style={{fontSize:11,color:T.textSub,marginBottom:14,lineHeight:1.7}}>
+            E-Trade applies position-specific maintenance requirements — not a flat 25%. Each position shown below contributes to your true margin call threshold. Higher-volatility holdings cost more to hold on margin.
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:12,marginBottom:20}}>
+            {[
+              {l:"Weighted Maint. Rate",v:fmtPct(weightedMaintRate,1),c:weightedMaintRate>0.40?T.red:weightedMaintRate>0.30?T.amber:T.green,sub:"vs flat 25% Reg T"},
+              {l:"Maintenance Req. $",v:fmt$(maintenanceDollars),c:T.red,sub:"must always be covered"},
+              {l:"Available to Withdraw",v:fmt$(availableToWithdraw),c:availableToWithdraw>500?T.green:availableToWithdraw>0?T.amber:T.red,sub:"E-Trade's calculation"},
+              {l:"True Call Threshold",v:isFinite(trueMarginCallDrop)?`−${trueMarginCallDrop.toFixed(1)}%`:"∞",c:isFinite(trueMarginCallDrop)&&trueMarginCallDrop<20?T.red:T.green,sub:`vs −${isFinite(flatCallDrop)?flatCallDrop.toFixed(1):"∞"}% flat 25%`},
+            ].map(({l,v,c,sub})=>(
+              <div key={l} style={{background:T.surfaceAlt,borderRadius:T.radiusSm,padding:"14px 16px",border:`1px solid ${T.borderLight}`}}>
+                <div style={{fontSize:10,fontWeight:700,letterSpacing:"1px",color:T.textMuted,marginBottom:6}}>{l}</div>
+                <div style={{fontSize:18,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</div>
+                <div style={{fontSize:10,color:T.textMuted,marginTop:4}}>{sub}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead><tr style={{borderBottom:`2px solid ${T.border}`}}>
+                {["Ticker","Market Value","Maint. Req. %","Maint. Req. $","% of Total Burden","Risk Level"].map(h=>(
+                  <th key={h} style={{padding:"8px 12px",textAlign:h==="Ticker"?"left":"right",fontSize:10,fontWeight:700,letterSpacing:"1px",color:T.textMuted}}>{h}</th>
+                ))}
+              </tr></thead>
+              <tbody>
+                {maintBreakdown.map((p,i)=>{
+                  const totalBurden = maintBreakdown.reduce((s,x)=>s+x.burden,0);
+                  const burdenPct = totalBurden>0?p.burden/totalBurden:0;
+                  const riskColor = p.req>=0.60?T.rose:p.req>=0.50?T.red:p.req>=0.40?T.amber:p.req>=0.30?T.textSub:T.green;
+                  const riskLabel = p.req>=0.60?"Very High":p.req>=0.50?"High":p.req>=0.40?"Elevated":p.req>=0.30?"Moderate":"Standard";
+                  return(
+                    <tr key={p.ticker} style={{borderBottom:`1px solid ${T.borderLight}`,background:i%2===0?"transparent":T.surfaceAlt}}>
+                      <td style={{padding:"10px 12px",fontWeight:700,color:T.text,fontFamily:"'Lora', serif"}}>{p.ticker}</td>
+                      <td style={{padding:"10px 12px",textAlign:"right",color:T.textSub}}>{fmt$(p.mv)}</td>
+                      <td style={{padding:"10px 12px",textAlign:"right",fontWeight:700,color:riskColor}}>{fmtPct(p.req,0)}</td>
+                      <td style={{padding:"10px 12px",textAlign:"right",color:T.red,fontWeight:600}}>{fmt$(p.burden)}</td>
+                      <td style={{padding:"10px 12px",textAlign:"right"}}>
+                        <div style={{display:"flex",justifyContent:"flex-end",alignItems:"center",gap:8}}>
+                          <div style={{width:60,height:4,background:T.borderLight,borderRadius:2,overflow:"hidden"}}>
+                            <div style={{height:"100%",width:`${Math.min(100,burdenPct*100)}%`,background:riskColor,borderRadius:2}}/>
+                          </div>
+                          <span style={{fontSize:11,color:T.textSub,minWidth:32,textAlign:"right"}}>{fmtPct(burdenPct,0)}</span>
+                        </div>
+                      </td>
+                      <td style={{padding:"10px 12px",textAlign:"right"}}>
+                        <span style={{
+                          fontSize:9,fontWeight:700,padding:"2px 7px",borderRadius:20,
+                          background: riskColor===T.green?T.greenBg:riskColor===T.textSub?T.surfaceAlt:riskColor===T.amber?T.amberBg:T.redBg,
+                          color: riskColor,
+                          border: `1px solid ${riskColor===T.green?T.greenBorder:riskColor===T.textSub?T.border:riskColor===T.amber?T.amberBorder:T.redBorder}`,
+                        }}>{riskLabel}</span>
+                      </td>
+                    </tr>
+                  );
+                })}
+                <tr style={{borderTop:`2px solid ${T.border}`,background:T.surfaceAlt}}>
+                  <td style={{padding:"10px 12px",fontWeight:700,color:T.text}}>TOTAL</td>
+                  <td style={{padding:"10px 12px",textAlign:"right",fontWeight:700,color:T.text}}>{fmt$(gross)}</td>
+                  <td style={{padding:"10px 12px",textAlign:"right",fontWeight:700,color:weightedMaintRate>0.40?T.red:weightedMaintRate>0.30?T.amber:T.green}}>{fmtPct(weightedMaintRate,1)}</td>
+                  <td style={{padding:"10px 12px",textAlign:"right",fontWeight:700,color:T.red}}>{fmt$(maintenanceDollars)}</td>
+                  <td style={{padding:"10px 12px",textAlign:"right",fontWeight:700,color:T.text}}>100%</td>
+                  <td/>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {/* ── CURRENT POSITION / POST-CRASH CARDS ── */}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
         <Card style={{background:T.text}}>
           <div style={{fontSize:10,fontWeight:700,letterSpacing:"1.5px",color:"rgba(255,255,255,0.4)",marginBottom:12}}>CURRENT POSITION</div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
-            {[{l:"Equity",v:fmtPct(precrashEquity),c:precrashEquity>=0.60?"#6EE7B7":"#FCD34D"},{l:"Gross",v:fmt$(gross),c:"#fff"},{l:"Margin",v:fmt$(margin),c:margin>0?"#FCA5A5":"#6EE7B7"},{l:"Net Value",v:fmt$(gross-margin),c:"#fff"}].map(({l,v,c})=>(<div key={l}><div style={{fontSize:10,color:"rgba(255,255,255,0.4)",marginBottom:4}}>{l}</div><div style={{fontSize:16,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</div></div>))}
+            {[
+              {l:"Equity",v:fmtPct(precrashEquity),c:precrashEquity>=0.60?"#6EE7B7":"#FCD34D"},
+              {l:"Gross",v:fmt$(gross),c:"#fff"},
+              {l:"Margin",v:fmt$(margin),c:margin>0?"#FCA5A5":"#6EE7B7"},
+              {l:"Available to Withdraw",v:fmt$(availableToWithdraw),c:availableToWithdraw>500?"#6EE7B7":availableToWithdraw>0?"#FCD34D":"#FCA5A5"},
+            ].map(({l,v,c})=>(
+              <div key={l}><div style={{fontSize:10,color:"rgba(255,255,255,0.4)",marginBottom:4}}>{l}</div><div style={{fontSize:15,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</div></div>
+            ))}
           </div>
         </Card>
         <Card style={{background:status.bg,border:`1px solid ${status.border}`}}>
           <div style={{fontSize:10,fontWeight:700,letterSpacing:"1.5px",color:status.color,marginBottom:12}}>AFTER −{drawdown}% CRASH</div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
-            {[{l:"Equity",v:fmtPct(postCrashEquity),c:status.color},{l:"Gross",v:fmt$(postCrashGross),c:T.text},{l:"Dollar Loss",v:"−"+fmt$(dollarLoss),c:T.red},{l:"Net Value",v:fmt$(postCrashGross-margin),c:T.text}].map(({l,v,c})=>(<div key={l}><div style={{fontSize:10,color:T.textMuted,marginBottom:4}}>{l}</div><div style={{fontSize:16,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</div></div>))}
+            {[
+              {l:"Equity",v:fmtPct(postCrashEquity),c:status.color},
+              {l:"Gross",v:fmt$(postCrashGross),c:T.text},
+              {l:"Dollar Loss",v:"−"+fmt$(dollarLoss),c:T.red},
+              {l:"Net Value",v:fmt$(postCrashGross-margin),c:T.text},
+            ].map(({l,v,c})=>(
+              <div key={l}><div style={{fontSize:10,color:T.textMuted,marginBottom:4}}>{l}</div><div style={{fontSize:15,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</div></div>
+            ))}
           </div>
           <div style={{marginTop:14,display:"flex",gap:8,flexWrap:"wrap"}}>
             <span style={{fontSize:11,fontWeight:700,padding:"3px 10px",borderRadius:20,background:"rgba(0,0,0,0.07)",color:status.color}}>{status.label}</span>
-            {recoveryMonths!==null?<span style={{fontSize:11,fontWeight:600,color:T.indigo,padding:"3px 10px",borderRadius:20,background:T.indigoBg,border:`1px solid ${T.indigoBorder}`}}>Recovery: ~{recoveryMonths} months</span>:<span style={{fontSize:11,fontWeight:600,color:T.red,padding:"3px 10px",borderRadius:20,background:T.redBg,border:`1px solid ${T.redBorder}`}}>Recovery: &gt;10 years</span>}
+            {recoveryMonths!==null
+              ?<span style={{fontSize:11,fontWeight:600,color:T.indigo,padding:"3px 10px",borderRadius:20,background:T.indigoBg,border:`1px solid ${T.indigoBorder}`}}>Recovery: ~{recoveryMonths} months</span>
+              :<span style={{fontSize:11,fontWeight:600,color:T.red,padding:"3px 10px",borderRadius:20,background:T.redBg,border:`1px solid ${T.redBorder}`}}>Recovery: &gt;10 years</span>
+            }
           </div>
         </Card>
       </div>
+
+      {/* ── CRASH SIMULATOR ── */}
       <Card>
         <SectionLabel>CRASH SIMULATOR</SectionLabel>
         <style>{`.crash-slider{-webkit-appearance:none;height:6px;border-radius:3px;outline:none;cursor:pointer}.crash-slider::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:${T.red};border:3px solid #fff;box-shadow:0 2px 6px rgba(220,38,38,0.4);cursor:pointer}.crash-slider::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:${T.red};border:none;cursor:pointer}`}</style>
@@ -1312,26 +1698,128 @@ function StressTestTab({ latest, settings }) {
         <input type="range" min="1" max="70" value={drawdown} onChange={e=>setDrawdown(Number(e.target.value))} className="crash-slider" style={{width:"100%",marginBottom:10,background:`linear-gradient(90deg,${T.red} 0%,${T.red} ${(drawdown/70)*100}%,${T.borderLight} ${(drawdown/70)*100}%,${T.borderLight} 100%)`}}/>
         <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:T.textMuted,marginBottom:16}}><span>−1%</span><span>−15% correction</span><span>−30% bear</span><span>−50% crash</span><span>−70% crisis</span></div>
         <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-          {[{l:"Correction",v:10},{l:"Bear Market",v:25},{l:"2008 Crisis",v:38},{l:"Dot-Com",v:50},{l:"Worst Case",v:60}].map(({l,v})=>(<button key={v} onClick={()=>setDrawdown(v)} style={{padding:"5px 12px",background:drawdown===v?T.red:T.surfaceAlt,color:drawdown===v?"#fff":T.textSub,border:`1px solid ${drawdown===v?T.red:T.border}`,borderRadius:20,fontSize:11,fontWeight:600,fontFamily:"inherit",transition:"all 0.18s",cursor:"pointer"}}>{l} ({v}%)</button>))}
+          {[{l:"Correction",v:10},{l:"Bear Market",v:25},{l:"2008 Crisis",v:38},{l:"Dot-Com",v:50},{l:"Worst Case",v:60}].map(({l,v})=>(
+            <button key={v} onClick={()=>setDrawdown(v)} style={{padding:"5px 12px",background:drawdown===v?T.red:T.surfaceAlt,color:drawdown===v?"#fff":T.textSub,border:`1px solid ${drawdown===v?T.red:T.border}`,borderRadius:20,fontSize:11,fontWeight:600,fontFamily:"inherit",transition:"all 0.18s",cursor:"pointer"}}>{l} ({v}%)</button>
+          ))}
         </div>
       </Card>
-      <Card><SectionLabel>SAFETY CUSHION</SectionLabel><div style={{fontSize:12,color:T.textSub,marginBottom:20,lineHeight:1.6}}>How much the market can drop before each critical line is crossed.</div><CushionBar label="Before hitting 60% trigger" dropPct={drop60} color={T.green} bg={T.greenBg} border={T.greenBorder}/><CushionBar label="Before hitting 55% hard floor" dropPct={drop55} color={T.amber} bg={T.amberBg} border={T.amberBorder}/><CushionBar label="Before margin call (25% maintenance)" dropPct={dropCall25} color={T.rose} bg={T.roseBg} border={T.roseBorder}/></Card>
-      <Card><SectionLabel>RECOVERY TRAJECTORY — AFTER −{drawdown}% CRASH</SectionLabel><div style={{fontSize:12,color:T.textSub,marginBottom:14}}>Indigo dashed = pre-crash equity ({fmtPct(precrashEquity)}). {recoveryMonths!==null?`Full recovery in ~${recoveryMonths} months.`:"Full recovery >10 years at current pace."}</div><RecoveryChart postCrashGross={postCrashGross} margin={margin} divs={postCrashDivs} w2={w2} bills={bills} marginRate={marginRate} yield_={yield_} precrashEquity={precrashEquity}/></Card>
+
+      {/* ── SAFETY CUSHION ── */}
+      <Card>
+        <SectionLabel>SAFETY CUSHION</SectionLabel>
+        <div style={{fontSize:12,color:T.textSub,marginBottom:20,lineHeight:1.6}}>
+          How much the market can drop before each critical threshold is crossed. The margin call bar uses your actual position-level requirements{hasPositions?` (${fmtPct(weightedMaintRate,1)} weighted blend)`:" — upload holdings for accurate calculation"}.
+        </div>
+        <CushionBar
+          label="Before hitting 60% trigger"
+          dropPct={drop60}
+          color={T.green} bg={T.greenBg} border={T.greenBorder}
+        />
+        <CushionBar
+          label="Before hitting 55% hard floor"
+          dropPct={drop55}
+          color={T.amber} bg={T.amberBg} border={T.amberBorder}
+        />
+        <CushionBar
+          label={hasPositions?"True margin call threshold (position-weighted)":"Margin call — 25% Reg T (upload holdings for accuracy)"}
+          dropPct={trueMarginCallDrop}
+          color={T.rose} bg={T.roseBg} border={T.roseBorder}
+          note={hasPositions&&callDropDelta!==null&&callDropDelta>0.5?`⚠ Flat 25% estimate was ${callDropDelta.toFixed(1)}% too optimistic — real threshold is tighter`:null}
+        />
+      </Card>
+
+      {/* ── RECOVERY TRAJECTORY ── */}
+      <Card>
+        <SectionLabel>RECOVERY TRAJECTORY — AFTER −{drawdown}% CRASH</SectionLabel>
+        <div style={{fontSize:12,color:T.textSub,marginBottom:14}}>
+          Indigo dashed = pre-crash equity ({fmtPct(precrashEquity)}). {recoveryMonths!==null?`Full recovery in ~${recoveryMonths} months.`:"Full recovery >10 years at current pace."}
+        </div>
+        <RecoveryChart postCrashGross={postCrashGross} margin={margin} divs={postCrashDivs} w2={w2} bills={bills} marginRate={marginRate} yield_={yield_} precrashEquity={precrashEquity}/>
+      </Card>
+
+      {/* ── FULL SCENARIO GRID ── */}
       <Card>
         <SectionLabel>FULL SCENARIO GRID — CLICK TO SIMULATE</SectionLabel>
         <div style={{overflowX:"auto"}}>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-            <thead><tr style={{borderBottom:`2px solid ${T.border}`}}>{["Drop","Post-Crash Equity","Net Value","Divs/Mo","Status","Recovery"].map(h=><th key={h} style={{padding:"8px 14px",textAlign:"left",fontSize:10,fontWeight:700,letterSpacing:"1px",color:T.textMuted}}>{h}</th>)}</tr></thead>
+            <thead><tr style={{borderBottom:`2px solid ${T.border}`}}>
+              {["Drop","Post-Crash Equity","Net Value","Divs/Mo","Status","Recovery","Maint. Call?"].map(h=>(
+                <th key={h} style={{padding:"8px 14px",textAlign:"left",fontSize:10,fontWeight:700,letterSpacing:"1px",color:T.textMuted}}>{h}</th>
+              ))}
+            </tr></thead>
             <tbody>
-              {SCENARIOS.map(pct=>{const dFrac=pct/100;const pcg=gross*(1-dFrac);const pce=margin>0?(pcg-margin)/pcg:1.0;const pcd=pcg*yield_/12;const rec=calcRecoveryMonths(pcg,margin,pcd,w2,bills,marginRate,yield_,precrashEquity);const st=eqStatus(pce);const isActive=pct===drawdown;return(<tr key={pct} onClick={()=>setDrawdown(pct)} style={{borderBottom:`1px solid ${T.borderLight}`,background:isActive?T.surfaceAlt:"transparent",cursor:"pointer"}} onMouseEnter={ev=>{if(!isActive)ev.currentTarget.style.background=T.surfaceAlt;}} onMouseLeave={ev=>{if(!isActive)ev.currentTarget.style.background="transparent";}}><td style={{padding:"11px 14px",fontWeight:700,color:pct>=40?T.red:pct>=20?T.amber:T.text,fontFamily:"'Lora', serif",fontSize:14}}>−{pct}%</td><td style={{padding:"11px 14px",fontWeight:700,color:st.color,fontSize:14,fontFamily:"'Lora', serif"}}>{fmtPct(pce)}</td><td style={{padding:"11px 14px",color:T.textSub}}>{fmt$(pcg-margin)}</td><td style={{padding:"11px 14px",color:T.green}}>{fmt$(pcd)}</td><td style={{padding:"11px 14px"}}><span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:20,background:st.bg,color:st.color,border:`1px solid ${st.border}`}}>{st.label}</span></td><td style={{padding:"11px 14px",color:T.indigo,fontWeight:600}}>{rec!==null?`${rec} months`:<span style={{color:T.red}}>&gt;10 years</span>}</td></tr>);})}
+              {SCENARIOS.map(pct=>{
+                const dFrac=pct/100;
+                const pcg=gross*(1-dFrac);
+                const pce=margin>0?(pcg-margin)/pcg:1.0;
+                const pcd=pcg*yield_/12;
+                const rec=calcRecoveryMonths(pcg,margin,pcd,w2,bills,marginRate,yield_,precrashEquity);
+                const st=eqStatus(pce);
+                const isActive=pct===drawdown;
+                // True margin call: does post-crash equity fall below weighted maintenance rate?
+                const postMaintDollars = maintenanceDollars*(1-dFrac);
+                const marginCallTriggered = hasPositions&&margin>0&&(pcg-margin)<postMaintDollars;
+                return(
+                  <tr key={pct} onClick={()=>setDrawdown(pct)}
+                    style={{borderBottom:`1px solid ${T.borderLight}`,background:isActive?T.surfaceAlt:"transparent",cursor:"pointer"}}
+                    onMouseEnter={ev=>{if(!isActive)ev.currentTarget.style.background=T.surfaceAlt;}}
+                    onMouseLeave={ev=>{if(!isActive)ev.currentTarget.style.background="transparent";}}>
+                    <td style={{padding:"11px 14px",fontWeight:700,color:pct>=40?T.red:pct>=20?T.amber:T.text,fontFamily:"'Lora', serif",fontSize:14}}>−{pct}%</td>
+                    <td style={{padding:"11px 14px",fontWeight:700,color:st.color,fontSize:14,fontFamily:"'Lora', serif"}}>{fmtPct(pce)}</td>
+                    <td style={{padding:"11px 14px",color:T.textSub}}>{fmt$(pcg-margin)}</td>
+                    <td style={{padding:"11px 14px",color:T.green}}>{fmt$(pcd)}</td>
+                    <td style={{padding:"11px 14px"}}><span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:20,background:st.bg,color:st.color,border:`1px solid ${st.border}`}}>{st.label}</span></td>
+                    <td style={{padding:"11px 14px",color:T.indigo,fontWeight:600}}>{rec!==null?`${rec} months`:<span style={{color:T.red}}>&gt;10 years</span>}</td>
+                    <td style={{padding:"11px 14px"}}>
+                      {!hasPositions?<span style={{fontSize:10,color:T.textMuted}}>—</span>
+                        :marginCallTriggered
+                          ?<span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:20,background:T.roseBg,color:T.rose,border:`1px solid ${T.roseBorder}`}}>⚠ Call triggered</span>
+                          :<span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:20,background:T.greenBg,color:T.green,border:`1px solid ${T.greenBorder}`}}>Safe</span>
+                      }
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
+        {hasPositions&&<div style={{marginTop:10,fontSize:11,color:T.textMuted,padding:"8px 12px",background:T.surfaceAlt,borderRadius:T.radiusXs}}>Margin call column uses position-level maintenance ({fmtPct(weightedMaintRate,1)} weighted) — not the flat 25% Reg T minimum.</div>}
       </Card>
+
+      {/* ── ADD BILL THEN CRASH ── */}
       <Card style={{background:T.indigoBg,border:`1px solid ${T.indigoBorder}`,boxShadow:"none"}}>
         <SectionLabel>WHAT IF YOU ADD A BILL, THEN THE MARKET CRASHES?</SectionLabel>
-        <div style={{display:"flex",gap:14,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}><span style={{fontSize:12,color:T.textSub}}>Simulate adding</span><div style={{display:"flex",alignItems:"center",gap:6}}><span style={{color:T.textMuted}}>$</span><input value={nextBillAmt} onChange={e=>setNextBillAmt(e.target.value)} style={{width:80,padding:"7px 10px",background:T.surface,border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusXs,fontSize:14,fontWeight:700,color:T.indigo,fontFamily:"'Lora', serif",outline:"none",textAlign:"right"}}/><span style={{color:T.textMuted}}>/mo</span></div><span style={{fontSize:12,color:T.textSub}}>then absorbing a −{drawdown}% crash</span></div>
-        {(()=>{const billAmt=parseNum(nextBillAmt)||0;if(!billAmt)return null;const pcg2=gross*(1-d);const pce2=margin>0?(pcg2-margin)/pcg2:1.0;const rec2=calcRecoveryMonths(pcg2,margin,pcg2*yield_/12,w2+billAmt,bills+billAmt,marginRate,yield_,precrashEquity);const st2=eqStatus(pce2);return(<div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:14}}>{[{l:"Crash equity (no new bill)",v:fmtPct(postCrashEquity),c:status.color},{l:`Crash equity (with +${fmt$(billAmt,0)}/mo)`,v:fmtPct(pce2),c:st2.color},{l:"Recovery (with new bill)",v:rec2!==null?`${rec2} months`:">10 years",c:T.indigo}].map(({l,v,c})=>(<div key={l} style={{background:T.surface,borderRadius:T.radiusSm,padding:"14px 16px",border:`1px solid ${T.indigoBorder}`}}><div style={{fontSize:11,color:T.textMuted,marginBottom:6,lineHeight:1.4}}>{l}</div><div style={{fontSize:20,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</div></div>))}</div>);})()}
+        <div style={{display:"flex",gap:14,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
+          <span style={{fontSize:12,color:T.textSub}}>Simulate adding</span>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <span style={{color:T.textMuted}}>$</span>
+            <input value={nextBillAmt} onChange={e=>setNextBillAmt(e.target.value)} style={{width:80,padding:"7px 10px",background:T.surface,border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusXs,fontSize:14,fontWeight:700,color:T.indigo,fontFamily:"'Lora', serif",outline:"none",textAlign:"right"}}/>
+            <span style={{color:T.textMuted}}>/mo</span>
+          </div>
+          <span style={{fontSize:12,color:T.textSub}}>then absorbing a −{drawdown}% crash</span>
+        </div>
+        {(()=>{
+          const billAmt=parseNum(nextBillAmt)||0;
+          if(!billAmt)return null;
+          const pcg2=gross*(1-d);
+          const pce2=margin>0?(pcg2-margin)/pcg2:1.0;
+          const rec2=calcRecoveryMonths(pcg2,margin,pcg2*yield_/12,w2+billAmt,bills+billAmt,marginRate,yield_,precrashEquity);
+          const st2=eqStatus(pce2);
+          return(
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:14}}>
+              {[
+                {l:"Crash equity (no new bill)",v:fmtPct(postCrashEquity),c:status.color},
+                {l:`Crash equity (with +${fmt$(billAmt,0)}/mo)`,v:fmtPct(pce2),c:st2.color},
+                {l:"Recovery time (with new bill)",v:rec2!==null?`${rec2} months`:">10 years",c:T.indigo},
+              ].map(({l,v,c})=>(
+                <div key={l} style={{background:T.surface,borderRadius:T.radiusSm,padding:"14px 16px",border:`1px solid ${T.indigoBorder}`}}>
+                  <div style={{fontSize:11,color:T.textMuted,marginBottom:6,lineHeight:1.4}}>{l}</div>
+                  <div style={{fontSize:20,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</div>
+                </div>
+              ))}
+            </div>
+          );
+        })()}
       </Card>
     </div>
   );
@@ -1514,11 +2002,14 @@ function HelpPage() {
           <Term term="Equity %" color={T.green}><strong>(Gross − Margin) ÷ Gross.</strong> The single most important number. Keep above 60% to add bills, 55% always.</Term>
           <Term term="Net Margin Draw" color={T.red}><strong>Bills − Dividends.</strong> Monthly amount added to margin. Goal: $0.</Term>
           <Term term="Blended Yield (Holdings)" color={T.indigo}>Calculated from your actual positions: Total Est. Annual Income ÷ Total Market Value. More accurate than a flat 23% assumption as your portfolio grows and evolves.</Term>
+          <Term term="Maintenance Requirement" color={T.red}>E-Trade's position-specific minimum equity requirement. Standard ETFs: 25%. High-yield options ETFs (XDTE, QDTE, WPAY): 50%. TQQQ (3× leveraged): 90%. Higher than Reg T's flat 25% for volatile holdings. Drives your true margin call threshold.</Term>
+          <Term term="Weighted Maintenance Rate" color={T.red}>Your portfolio's blended maintenance requirement — the average of each position's requirement weighted by its market value. A 40% weighted rate means E-Trade requires you to maintain 40% equity on average across your holdings. This is your true margin call floor — not 25%.</Term>
+          <Term term="Available to Withdraw">max(0, Equity − Maintenance Requirement$). The amount E-Trade will let you move out of the account. Found in E-Trade → Balances. YieldStack calculates it from position-level maintenance requirements once holdings are uploaded.</Term>
           <Term term="Holdings Snapshot">A full point-in-time capture of your portfolio — every position, market value, gain/loss, and yield. Stored separately from monthly logs. Upload as often as you like.</Term>
         </Card>
         <Card>
           <SectionLabel>KEY NUMBERS</SectionLabel>
-          {[{l:"Trigger equity",v:"60%",c:T.green},{l:"Hard floor",v:"55%",c:T.amber},{l:"Rising streak",v:"2 months",c:T.text},{l:"Forward check",v:"3 months",c:T.blue},{l:"Target yield",v:"23%",c:T.green},{l:"Negotiated rate",v:"8.44%",c:T.red},{l:"E-Trade maintenance",v:"25%",c:T.rose}].map(({l,v,c})=>(<div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:`1px solid ${T.borderLight}`}}><span style={{fontSize:12,color:T.text}}>{l}</span><span style={{fontSize:15,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</span></div>))}
+          {[{l:"Trigger equity",v:"60%",c:T.green},{l:"Hard floor",v:"55%",c:T.amber},{l:"Rising streak",v:"2 months",c:T.text},{l:"Forward check",v:"3 months",c:T.blue},{l:"Target yield",v:"23%",c:T.green},{l:"Negotiated rate",v:"8.44%",c:T.red},{l:"Reg T minimum",v:"25%",c:T.textSub},{l:"True maint. (your port.)",v:"See Holdings tab",c:T.red}].map(({l,v,c})=>(<div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:`1px solid ${T.borderLight}`}}><span style={{fontSize:12,color:T.text}}>{l}</span><span style={{fontSize:15,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</span></div>))}
           <div style={{marginTop:16}}><SectionLabel>WHERE TO FIND YOUR NUMBERS</SectionLabel>
             {[{l:"Gross (Total Assets)",w:"Balance Sheet → Total Assets"},{l:"Margin Loan",w:"Balance Sheet → Cash, BDP, MMFs (Debit)"},{l:"Monthly Deposits",w:"Cash Flow → Electronic Transfers-Credits (This Period)"},{l:"Bills Floated",w:"Debit Card & Checking Activity → Total Automated Payments"},{l:"Actual Dividends",w:"Income and Distribution Summary → Total Income"},{l:"Actual Interest",w:"Margin Loan Interest Schedule → Total Interest"},{l:"Your Margin Rate",w:"Margin Loan Interest Schedule → Interest Rate %"}].map(({l,w})=>(<div key={l} style={{padding:"9px 12px",background:T.surfaceAlt,borderRadius:T.radiusXs,marginBottom:6}}><div style={{fontSize:11,fontWeight:600,color:T.text}}>{l}</div><div style={{fontSize:11,color:T.textMuted,marginTop:2}}>→ {w}</div></div>))}
           </div>
@@ -1690,16 +2181,22 @@ export default function App() {
         estimatedInterest, actualInterest: null,
         w2, bills, coverage, netDraw: Math.max(0, bills - monthlyEAI),
         trueNetDraw,
+        availableToWithdraw: calcAvailableToWithdraw(g, m, latestHoldings.positions),
+        weightedMaintRate: calcWeightedMaintenanceRate(latestHoldings.positions),
         date: latest?.date || new Date().toISOString().slice(0, 7),
         equityMomentum: latest?.equityMomentum || null,
         actualYield: latestHoldings.totalEstAnnIncome && g > 0
           ? latestHoldings.totalEstAnnIncome / g : effectiveYield,
         fromHoldings: true,
-        marginIsEstimated,  // true when margin came from last log, not CSV
+        marginIsEstimated,
         holdingsDate: latestHoldings.uploadedAt,
       };
     }
-    return latest ? { ...latest, fromHoldings: false, marginIsEstimated: false } : null;
+    return latest ? {
+      ...latest, fromHoldings: false, marginIsEstimated: false,
+      availableToWithdraw: calcAvailableToWithdraw(latest.gross, latest.margin, null),
+      weightedMaintRate: DEFAULT_MAINTENANCE_REQ,
+    } : null;
   }, [latest, latestHoldings, effectiveYield, settings.marginRate]);
   const nextBillAmt=parseNum(nextBill)||200;
   let risingStreak=0; for(let i=computed.length-1;i>=1;i--){if(computed[i].rising)risingStreak++;else break;}
@@ -1743,7 +2240,7 @@ export default function App() {
     if(!form.gross.trim()){setSaveError("Gross Portfolio is required.");return;}
     if(g<=0){setSaveError("Gross Portfolio must be greater than 0.");return;}
     if(!form.w2.trim()||w<=0){setSaveError("Monthly Deposits is required.");return;}
-    if(!form.bills.trim()||b<=0){setSaveError("Bills Floated is required.");return;}
+    if(form.bills.trim()===""||b<0){setSaveError("Bills Floated is required (enter 0 if none yet).");return;}
     try{
       const actualDivs=form.actualDivs.trim()!==""?parseNum(form.actualDivs):null;
       const actualInterest=form.actualInterest.trim()!==""?parseNum(form.actualInterest):null;
@@ -1944,7 +2441,7 @@ export default function App() {
                       {l:"EQUITY",v:fmtPct(currentSnapshot.equity),c:eqColor(currentSnapshot.equity)},
                       {l:"DIVS / MO",v:fmt$(currentSnapshot.effectiveDivs),c:T.green,badge:currentSnapshot.fromHoldings?"HOLDINGS":"EST"},
                       {l:"COVERAGE",v:fmtPct(currentSnapshot.coverage,1),c:currentSnapshot.coverage>=1?T.green:T.amber},
-                      {l:"INTEREST / MO",v:fmt$(currentSnapshot.effectiveInterest),c:T.red,badge:"EST"},
+                      {l:"AVAIL. TO WITHDRAW",v:fmt$(currentSnapshot.availableToWithdraw||0),c:(currentSnapshot.availableToWithdraw||0)>500?T.green:(currentSnapshot.availableToWithdraw||0)>0?T.amber:T.red,badge:currentSnapshot.fromHoldings?"ACTUAL":"EST"},
                       {l:"NET DRAW",v:fmt$(currentSnapshot.trueNetDraw),c:currentSnapshot.trueNetDraw>0?T.red:T.green},
                     ].map(({l,v,c,badge})=><StatTile key={l} label={l} value={v} color={c} size={14} badge={badge} serif/>)}
                   </div>
@@ -1969,7 +2466,7 @@ export default function App() {
         {activeTab==="bills"&&<BillTrackerTab billItems={billItems} setBillItems={setBillItems} saveBills={saveBills} latest={currentSnapshot} settings={fullSettings}/>}
         {activeTab==="holdings"&&<HoldingsTab holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots} saveHoldings={saveHoldings}/>}
         {activeTab==="dividends"&&<DividendsTab computed={computed}/>}
-        {activeTab==="stress"&&<StressTestTab latest={currentSnapshot} settings={fullSettings}/>}
+        {activeTab==="stress"&&<StressTestTab latest={currentSnapshot} settings={fullSettings} positions={latestHoldings?.positions||null}/>}
 
         {activeTab==="metrics"&&(
           <div>{!latest?<Card><div style={{textAlign:"center",padding:48,color:T.textMuted}}>Log your first month to see metrics.</div></Card>:(
