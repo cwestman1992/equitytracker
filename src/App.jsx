@@ -2180,10 +2180,14 @@ export default function App() {
   const currentSnapshot = useMemo(() => {
     if (!latest && !latestHoldings) return null;
 
+    // Use live Bill Tracker routing total as bills if any bills are configured,
+    // fall back to last logged value only if Bill Tracker hasn't been set up yet.
+    const liveBills = billItems.some(b => b.isFloated)
+      ? billItems.filter(b => b.isFloated).reduce((s, b) => s + b.amount, 0)
+      : (latest?.bills || 0);
+
     if (latestHoldings && (latestHoldings.totalAssets || 0) > 0) {
       const g = latestHoldings.totalAssets || 0;
-      // marginLoan is null when loaded from CSV (CSV has no margin column).
-      // Fall back to last log's margin so projections aren't wrong.
       const marginFromLog = latest?.margin || 0;
       const m = latestHoldings.marginLoan !== null && latestHoldings.marginLoan !== undefined
         ? latestHoldings.marginLoan
@@ -2194,7 +2198,7 @@ export default function App() {
         ? latestHoldings.totalEstAnnIncome / 12
         : g * effectiveYield / 12;
       const w2 = latest?.w2 || 0;
-      const bills = latest?.bills || 0;
+      const bills = liveBills;
       const estimatedInterest = m * settings.marginRate / 12;
       const coverage = bills > 0 ? monthlyEAI / bills : 0;
       const trueNetDraw = Math.max(0, bills + estimatedInterest - monthlyEAI);
@@ -2218,12 +2222,18 @@ export default function App() {
         holdingsDate: latestHoldings.uploadedAt,
       };
     }
+    // Fallback: log data only — still use live bills if Bill Tracker is configured
     return latest ? {
-      ...latest, fromHoldings: false, marginIsEstimated: false,
+      ...latest,
+      bills: liveBills,
+      coverage: liveBills > 0 ? (latest.effectiveDivs || 0) / liveBills : 0,
+      trueNetDraw: Math.max(0, liveBills + (latest.effectiveInterest || 0) - (latest.effectiveDivs || 0)),
+      netDraw: Math.max(0, liveBills - (latest.effectiveDivs || 0)),
+      fromHoldings: false, marginIsEstimated: false,
       availableToWithdraw: calcAvailableToWithdraw(latest.gross, latest.margin, null),
       weightedMaintRate: DEFAULT_MAINTENANCE_REQ,
     } : null;
-  }, [latest, latestHoldings, effectiveYield, settings.marginRate]);
+  }, [latest, latestHoldings, effectiveYield, settings.marginRate, billItems]);
   const nextBillAmt=parseNum(nextBill)||200;
   let risingStreak=0; for(let i=computed.length-1;i>=1;i--){if(computed[i].rising)risingStreak++;else break;}
   // Conditions: cond1 uses currentSnapshot equity (most current), cond2 uses log streak, cond3 uses currentSnapshot for projections
