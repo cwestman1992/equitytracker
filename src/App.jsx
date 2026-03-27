@@ -2481,7 +2481,7 @@ export default function App() {
                       {l:"EQUITY",v:fmtPct(currentSnapshot.equity),c:eqColor(currentSnapshot.equity)},
                       {l:"DIVS / MO",v:fmt$(currentSnapshot.effectiveDivs),c:T.green,badge:currentSnapshot.fromHoldings?"HOLDINGS":"EST"},
                       {l:"COVERAGE",v:fmtPct(currentSnapshot.coverage,1),c:currentSnapshot.coverage>=1?T.green:T.amber},
-                      {l:"AVAIL. TO WITHDRAW",v:fmt$(currentSnapshot.actualATW??currentSnapshot.availableToWithdraw||0),c:(currentSnapshot.actualATW??currentSnapshot.availableToWithdraw||0)>500?T.green:(currentSnapshot.actualATW??currentSnapshot.availableToWithdraw||0)>0?T.amber:T.red,badge:currentSnapshot.actualATW!=null?"ACTUAL":"EST",sub:currentSnapshot.actualATW!=null&&currentSnapshot.availableToWithdraw>0?`Model est. ${fmt$(currentSnapshot.availableToWithdraw)} (Δ ${fmt$(currentSnapshot.actualATW-currentSnapshot.availableToWithdraw)})`:undefined},
+                      {l:"AVAIL. TO WITHDRAW",v:fmt$((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0),c:((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0)>500?T.green:((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0)>0?T.amber:T.red,badge:currentSnapshot.actualATW!=null?"ACTUAL":"EST",sub:currentSnapshot.actualATW!=null&&currentSnapshot.availableToWithdraw>0?`Model est. ${fmt$(currentSnapshot.availableToWithdraw)} (Δ ${fmt$(currentSnapshot.actualATW-currentSnapshot.availableToWithdraw)})`:undefined},
                       {l:"NET DRAW",v:fmt$(currentSnapshot.trueNetDraw),c:currentSnapshot.trueNetDraw>0?T.red:T.green},
                     ].map(({l,v,c,badge})=><StatTile key={l} label={l} value={v} color={c} size={14} badge={badge} serif/>)}
                   </div>
@@ -2584,7 +2584,7 @@ export default function App() {
                     rows:[
                       {l:"Freedom Date",v:freedomDate||"—",c:T.indigo},
                       {l:"Bills covered",v:fmtPct(currentSnapshot.coverage,1),c:currentSnapshot.coverage>=1?T.green:T.amber},
-                      {l:"Avail. to withdraw",v:fmt$(currentSnapshot.actualATW??currentSnapshot.availableToWithdraw||0),c:(currentSnapshot.actualATW??currentSnapshot.availableToWithdraw||0)>500?T.green:T.amber},
+                      {l:"Avail. to withdraw",v:fmt$((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0),c:((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0)>500?T.green:T.amber},
                     ]},
                 ].map(({title,main,mainColor,sub,rows})=>(
                   <Card key={title}>
