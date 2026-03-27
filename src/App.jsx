@@ -5,7 +5,7 @@ const SETTINGS_KEY  = "p2p-settings-v1";
 const BILLS_KEY     = "p2p-bills-v1";
 const HOLDINGS_KEY  = "p2p-holdings-v1";
 
-const DEFAULT_SETTINGS = { marginRate: 0.0844, targetYield: 0.23, yieldMode: "manual" };
+const DEFAULT_SETTINGS = { marginRate: 0.0844, targetYield: 0.23, yieldMode: "manual", defaultW2: 871 };
 
 const parseNum = (s) => { const n = parseFloat(String(s).replace(/,/g, "")); return isNaN(n) ? 0 : n; };
 const fmt$ = (v, dec = 2) => "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec });
@@ -719,8 +719,8 @@ function BillModelerTab({ latest, settings }) {
   const MONTHS = 36;
   const appreciationRate = parseNum(appreciationRateStr) / 100;
 
-  // Effective values — use overrides if set, otherwise pull from snapshot/settings
-  const effectiveW2 = w2Override !== null ? parseNum(w2Override) : (latest?.w2 || 0);
+  // Effective values — use overrides if set, otherwise pull from settings.defaultW2
+  const effectiveW2 = w2Override !== null ? parseNum(w2Override) : (settings.defaultW2 || latest?.w2 || 0);
   const effectiveYield = yieldOverride !== null ? parseNum(yieldOverride)/100 : settings.effectiveYield;
 
   const maxSafeBase = latest ? findMaxSafeBill(latest.gross, latest.margin, latest.effectiveDivs, effectiveW2, latest.bills, settings.marginRate, effectiveYield, 0) : 0;
@@ -791,16 +791,16 @@ function BillModelerTab({ latest, settings }) {
           ].map(({l,v,c})=>(
             <div key={l} style={{textAlign:"center"}}><div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:4}}>{l}</div><div style={{fontSize:13,fontWeight:700,color:c||T.text}}>{v}</div></div>
           ))}
-          {/* Monthly Deposits — editable inline */}
+          {/* Monthly Deposits — editable inline, source is Settings.defaultW2 */}
           <div style={{textAlign:"center"}}>
             <div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:4}}>DEPOSITS/MO{w2Override!==null&&<span style={{color:T.amber}}> ✎</span>}</div>
             <input
-              value={w2Override !== null ? w2Override : String(latest.w2||0)}
+              value={w2Override !== null ? w2Override : String(settings.defaultW2||latest?.w2||0)}
               onChange={e=>setW2Override(e.target.value)}
-              onFocus={e=>{if(w2Override===null)setW2Override(String(latest.w2||0));}}
+              onFocus={e=>{if(w2Override===null)setW2Override(String(settings.defaultW2||latest?.w2||0));}}
               style={{width:"100%",padding:"4px 6px",background:w2Override!==null?T.amberBg:T.surfaceAlt,border:`1px solid ${w2Override!==null?T.amberBorder:T.borderLight}`,borderRadius:T.radiusXs,fontSize:13,fontWeight:700,color:T.indigo,fontFamily:"'Lora', serif",outline:"none",textAlign:"center"}}
             />
-            <div style={{fontSize:9,color:T.textMuted,marginTop:2}}>from last log{w2Override!==null?" (overridden)":""}</div>
+            <div style={{fontSize:9,color:T.textMuted,marginTop:2}}>from Settings{w2Override!==null?" (overridden)":""}</div>
           </div>
           {/* Yield — editable inline */}
           <div style={{textAlign:"center"}}>
@@ -814,7 +814,7 @@ function BillModelerTab({ latest, settings }) {
             <div style={{fontSize:9,color:T.textMuted,marginTop:2}}>% annual (from Settings{yieldOverride!==null?" overridden":""})</div>
           </div>
         </div>
-        {(effectiveW2===0||effectiveW2<200)&&<div style={{marginTop:10,padding:"8px 12px",background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusXs,fontSize:11,color:T.amber}}>⚠ Monthly Deposits appears to be {fmt$(effectiveW2,0)} — this seems low and will produce pessimistic projections. Check your last log entry (History tab) and update "Deposits/Mo" above to your actual monthly brokerage deposit (e.g. $871).</div>}
+        {effectiveW2 < 200 && <div style={{marginTop:10,padding:"8px 12px",background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusXs,fontSize:11,color:T.amber}}>⚠ Monthly Deposits is {fmt$(effectiveW2,0)} — this will produce very pessimistic projections. Set your normal deposit amount in Settings → Default Monthly Deposit, or type it directly in the field above.</div>}
       </Card>
       <Card>
         <SectionLabel>CONFIGURE SCENARIOS</SectionLabel>
@@ -1884,7 +1884,7 @@ function StressTestTab({ latest, settings, positions }) {
 
 // ── SETTINGS TAB ──────────────────────────────────────────────────────────────
 function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdingsYield, hasHoldings, onExport, onImport, importStatus }) {
-  const [local, setLocal] = useState({ ...settings, marginRateStr: (settings.marginRate*100).toFixed(2), targetYieldStr: (settings.targetYield*100).toFixed(1) });
+  const [local, setLocal] = useState({ ...settings, marginRateStr: (settings.marginRate*100).toFixed(2), targetYieldStr: (settings.targetYield*100).toFixed(1), defaultW2Str: String(settings.defaultW2||871) });
   const [sbUrl, setSbUrl] = useState(() => store.getSupabaseConfig()?.url || "");
   const [sbKey, setSbKey] = useState(() => store.getSupabaseConfig()?.anonKey || "");
   const [sbStatus, setSbStatus] = useState(store.getSupabaseConfig() ? "connected" : null);
@@ -1894,9 +1894,11 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
   const apply = () => {
     const mr=parseNum(local.marginRateStr)/100;
     const ty=parseNum(local.targetYieldStr)/100;
+    const dw=parseNum(local.defaultW2Str);
     if(mr<=0||mr>=1){setSaveMsg({ok:false,text:"Margin rate must be between 0% and 100%."});return;}
     if(ty<=0||ty>=2){setSaveMsg({ok:false,text:"Yield must be between 0% and 200%."});return;}
-    setSettings(s=>({...s,marginRate:mr,targetYield:ty,yieldMode:local.yieldMode}));
+    if(dw<=0){setSaveMsg({ok:false,text:"Default monthly deposit must be greater than $0."});return;}
+    setSettings(s=>({...s,marginRate:mr,targetYield:ty,yieldMode:local.yieldMode,defaultW2:dw}));
     setSaveMsg({ok:true,text:"Settings saved."});
     setTimeout(()=>setSaveMsg(null),3000);
   };
@@ -1929,6 +1931,22 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
           <div style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"14px 18px",minWidth:160,textAlign:"center"}}>
             <div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:6}}>CURRENT SETTING</div>
             <div style={{fontSize:32,fontWeight:700,color:T.red,fontFamily:"'Lora', serif"}}>{(settings.marginRate*100).toFixed(2)}%</div>
+          </div>
+        </div>
+      </Card>
+      <Card>
+        <SectionLabel>DEFAULT MONTHLY DEPOSIT</SectionLabel>
+        <div style={{display:"flex",gap:20,alignItems:"flex-end",flexWrap:"wrap"}}>
+          <div style={{flex:1,minWidth:200}}>
+            <Input label="Normal monthly deposit into E-Trade ($)" value={local.defaultW2Str} onChange={e=>setLocal(l=>({...l,defaultW2Str:e.target.value}))} placeholder="e.g. 871"/>
+            <div style={{marginTop:8,fontSize:11,color:T.textMuted,lineHeight:1.6}}>
+              This is what you normally deposit each month — your stable recurring amount. Used by all projection tools (Bill Modeler, Freedom Date, Stress Test). <strong style={{color:T.text}}>Set this to your baseline amount, not a bonus month.</strong> The monthly log still records what you actually deposited for historical accuracy — this setting only drives forward projections.
+            </div>
+          </div>
+          <div style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"14px 18px",minWidth:160,textAlign:"center"}}>
+            <div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:6}}>CURRENT SETTING</div>
+            <div style={{fontSize:32,fontWeight:700,color:T.indigo,fontFamily:"'Lora', serif"}}>{fmt$(settings.defaultW2||871,0)}</div>
+            <div style={{fontSize:10,color:T.textMuted,marginTop:4}}>per month</div>
           </div>
         </div>
       </Card>
@@ -1976,7 +1994,7 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
       </Card>
       <div style={{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
         <button onClick={apply} style={{padding:"11px 28px",background:T.text,color:"#fff",border:"none",borderRadius:T.radiusXs,fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>Save Settings</button>
-        <button onClick={()=>{setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0"});setSettings(DEFAULT_SETTINGS);setSaveMsg({ok:true,text:"Reset to defaults."});setTimeout(()=>setSaveMsg(null),3000);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
+        <button onClick={()=>{setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0",defaultW2Str:"871"});setSettings(DEFAULT_SETTINGS);setSaveMsg({ok:true,text:"Reset to defaults."});setTimeout(()=>setSaveMsg(null),3000);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
         {saveMsg&&<span style={{fontSize:12,fontWeight:600,color:saveMsg.ok?T.green:T.red}}>{saveMsg.ok?"✓":""} {saveMsg.text}</span>}
       </div>
 
@@ -2238,7 +2256,10 @@ export default function App() {
       const monthlyEAI = latestHoldings.totalEstAnnIncome
         ? latestHoldings.totalEstAnnIncome / 12
         : g * effectiveYield / 12;
-      const w2 = latest?.w2 || 0;
+      // Monthly deposit for projections: use the user-configured default from Settings.
+      // This is intentionally separate from the logged w2 (which varies month to month
+      // due to bonuses, partial periods, PDF extraction artifacts, etc.)
+      const w2 = settings.defaultW2 || latest?.w2 || 0;
       const bills = liveBills;
       const estimatedInterest = m * settings.marginRate / 12;
       const coverage = bills > 0 ? monthlyEAI / bills : 0;
@@ -2266,6 +2287,7 @@ export default function App() {
     // Fallback: log data only — still use live bills if Bill Tracker is configured
     return latest ? {
       ...latest,
+      w2: settings.defaultW2 || latest?.w2 || 0,
       bills: liveBills,
       coverage: liveBills > 0 ? (latest.effectiveDivs || 0) / liveBills : 0,
       trueNetDraw: Math.max(0, liveBills + (latest.effectiveInterest || 0) - (latest.effectiveDivs || 0)),
@@ -2274,7 +2296,7 @@ export default function App() {
       availableToWithdraw: calcAvailableToWithdraw(latest.gross, latest.margin, null),
       weightedMaintRate: DEFAULT_MAINTENANCE_REQ,
     } : null;
-  }, [latest, latestHoldings, effectiveYield, settings.marginRate, billItems]);
+  }, [latest, latestHoldings, effectiveYield, settings.marginRate, settings.defaultW2, billItems]);
   const nextBillAmt=parseNum(nextBill)||200;
   let risingStreak=0; for(let i=computed.length-1;i>=1;i--){if(computed[i].rising)risingStreak++;else break;}
   // Conditions: cond1 uses currentSnapshot equity (most current), cond2 uses log streak, cond3 uses currentSnapshot for projections
