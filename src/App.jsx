@@ -26,17 +26,19 @@ function getCashDividendsReceived(ticker, divLedger) {
 function getPositionTotalReturn(position, divLedger) {
   const { ticker, totalCost, unrealizedGL } = position;
   const divsReceived = getDividendsReceived(ticker, divLedger);
+  const cashDivsReceived = getCashDividendsReceived(ticker, divLedger);
   const totalReturnDollars = (unrealizedGL || 0) + divsReceived;
   const cost = totalCost || 0;
   return {
     ticker,
     paperGL: unrealizedGL || 0,
     dividendsReceived: divsReceived,
+    cashDividendsReceived: cashDivsReceived,
     totalReturnDollars,
     totalReturnPct: cost > 0 ? (totalReturnDollars / cost) * 100 : 0,
-    adjustedCostBasis: cost - divsReceived,
-    paidForItself: divsReceived >= cost && cost > 0,
-    recoveryPct: cost > 0 ? (divsReceived / cost) * 100 : 0,
+    adjustedCostBasis: cost - cashDivsReceived, // Only cash dividends reduce effective cost basis
+    paidForItself: cashDivsReceived >= cost && cost > 0, // Only cash dividends count toward "paid for itself"
+    recoveryPct: cost > 0 ? (cashDivsReceived / cost) * 100 : 0, // Cash recovery percentage
   };
 }
 
@@ -81,6 +83,9 @@ function parseFlexibleDate(dateStr) {
   let [month, day, year] = parts.map(p => parseInt(p, 10));
   if (year < 100) year = year > 50 ? 1900 + year : 2000 + year;
   if (month < 1 || month > 12 || day < 1 || day > 31 || year < 2000) return null;
+  // Reject future dates
+  const parsed = new Date(year, month - 1, day);
+  if (parsed > new Date()) return null;
   return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
@@ -1008,6 +1013,9 @@ function BillModelerTab({ latest, settings }) {
             </div>
           </Card>
         );})}
+      </div>
+      <div style={{marginTop:16,padding:"12px 16px",background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusSm,fontSize:11,color:T.amber,lineHeight:1.6}}>
+        <strong>⚠ NAV Erosion Not Modeled:</strong> Freedom Date projections assume portfolio value grows steadily. B3 high-yield positions (WPAY, MSTY, QQQY, etc.) experience NAV erosion — their share price declines over time even as they pay dividends. If your portfolio is B3-heavy, actual freedom may arrive later than projected.
       </div>
     </div>
   );
@@ -1992,7 +2000,7 @@ function StressTestTab({ latest, settings, positions }) {
             {[
               {l:"Weighted Maint. Rate",v:fmtPct(weightedMaintRate,1),c:weightedMaintRate>0.40?T.red:weightedMaintRate>0.30?T.amber:T.green,sub:"vs flat 25% Reg T"},
               {l:"Maintenance Req. $",v:fmt$(maintenanceDollars),c:T.red,sub:"must always be covered"},
-              {l:"Available to Withdraw",v:fmt$(latest?.actualATW??availableToWithdraw),c:(latest?.actualATW??availableToWithdraw)>500?T.green:(latest?.actualATW??availableToWithdraw)>0?T.amber:T.red,sub:latest?.actualATW!=null?`Model est. ${fmt$(availableToWithdraw)} · Δ ${fmt$(latest.actualATW-availableToWithdraw)}`:"Model est. — log actual ATW to calibrate"},
+              {l:"Available to Withdraw",v:fmt$(latest?.actualATW??availableToWithdraw),c:(latest?.actualATW??availableToWithdraw)>500?T.green:(latest?.actualATW??availableToWithdraw)>0?T.amber:T.red,sub:latest?.actualATW!=null?`Model: ${fmt$(availableToWithdraw)} · Δ ${fmt$(latest.actualATW-availableToWithdraw)}`:"Rough model — log actual ATW for accuracy"},
               {l:"True Call Threshold",v:isFinite(trueMarginCallDrop)?`−${trueMarginCallDrop.toFixed(1)}%`:"∞",c:isFinite(trueMarginCallDrop)&&trueMarginCallDrop<20?T.red:T.green,sub:`vs −${isFinite(flatCallDrop)?flatCallDrop.toFixed(1):"∞"}% flat 25%`},
             ].map(({l,v,c,sub})=>(
               <div key={l} style={{background:T.surfaceAlt,borderRadius:T.radiusSm,padding:"14px 16px",border:`1px solid ${T.borderLight}`}}>
@@ -2850,7 +2858,7 @@ export default function App() {
                 <Card style={{background:T.text}}>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:24}}>
                     {[
-                      {l:"FREEDOM DATE",v:freedomDate||"—",sub:freedomMonths?`${freedomMonths} months away`:""},
+                      {l:"FREEDOM DATE",v:freedomDate||"—",sub:freedomMonths?`${freedomMonths} mo · assumes stable NAV`:"assumes stable NAV"},
                       {l:"NET DRAW (w/ interest)",v:fmt$(currentSnapshot.trueNetDraw),sub:"bills + interest − dividends",c:currentSnapshot.trueNetDraw>0?"#FCA5A5":"#6EE7B7"},
                       {l:"ANNUAL RUN RATE",v:fmt$(currentSnapshot.effectiveDivs*12),sub:currentSnapshot.fromHoldings?"from holdings EAI":"estimated",c:"#6EE7B7"},
                       {l:"ALL-TIME DIVS",v:fmt$(totalDivsReceived),sub:totalDivsFromLedger?`${getLedgerEntryCount(divLedger)} dividends tracked`:`${entries.length} months logged (est)`,c:"#6EE7B7",badge:totalDivsFromLedger?"ACTUAL":"EST"},
@@ -2908,7 +2916,7 @@ export default function App() {
                       {l:"EQUITY",v:fmtPct(currentSnapshot.equity),c:eqColor(currentSnapshot.equity)},
                       {l:"DIVS / MO",v:fmt$(currentSnapshot.effectiveDivs),c:T.green,badge:currentSnapshot.fromHoldings?"HOLDINGS":"EST"},
                       {l:"COVERAGE",v:fmtPct(currentSnapshot.coverage,1),c:currentSnapshot.coverage>=1?T.green:T.amber},
-                      {l:"AVAIL. TO WITHDRAW",v:fmt$((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0),c:((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0)>500?T.green:((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0)>0?T.amber:T.red,badge:currentSnapshot.actualATW!=null?"ACTUAL":"EST",sub:currentSnapshot.actualATW!=null&&currentSnapshot.availableToWithdraw>0?`Model est. ${fmt$(currentSnapshot.availableToWithdraw)} (Δ ${fmt$(currentSnapshot.actualATW-currentSnapshot.availableToWithdraw)})`:undefined},
+                      {l:"AVAIL. TO WITHDRAW",v:fmt$((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0),c:((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0)>500?T.green:((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0)>0?T.amber:T.red,badge:currentSnapshot.actualATW!=null?"ACTUAL":"ROUGH",sub:currentSnapshot.actualATW!=null&&currentSnapshot.availableToWithdraw>0?`Model: ${fmt$(currentSnapshot.availableToWithdraw)} (Δ ${fmt$(currentSnapshot.actualATW-currentSnapshot.availableToWithdraw)})`:"model estimate — may differ from E-Trade"},
                       {l:"NET DRAW",v:fmt$(currentSnapshot.trueNetDraw),c:currentSnapshot.trueNetDraw>0?T.red:T.green},
                     ].map(({l,v,c,badge})=><StatTile key={l} label={l} value={v} color={c} size={14} badge={badge} serif/>)}
                   </div>
