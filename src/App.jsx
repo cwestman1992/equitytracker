@@ -206,15 +206,16 @@ const store = {
     try {
       if (method === "GET") {
         const r = await fetch(`${base}?key=eq.${encodeURIComponent(key)}&select=value`, { headers });
-        if (!r.ok) return null;
+        if (!r.ok) { console.warn(`[YieldStack] Supabase GET failed: ${r.status} ${r.statusText}`); return null; }
         const rows = await r.json();
         return rows?.[0]?.value ?? null;
       }
       if (method === "SET") {
         const r = await fetch(base, { method: "POST", headers, body: JSON.stringify({ key, value }) });
+        if (!r.ok) { console.warn(`[YieldStack] Supabase SET failed for ${key}: ${r.status} ${r.statusText}`); }
         return r.ok;
       }
-    } catch { return null; }
+    } catch (err) { console.warn(`[YieldStack] Supabase error:`, err); return null; }
   },
 
   async get(key) {
@@ -276,11 +277,19 @@ async function importAllData(file, setEntries, setSettings, setBillItems, setHol
         const data = JSON.parse(e.target.result);
         if (!data.version || !Array.isArray(data.entries)) throw new Error("Invalid backup file");
         if (data.entries) { setEntries(data.entries); await saveEntries(data.entries); }
-        if (data.settings) { setSettings(data.settings); await saveSettings(data.settings); }
+        if (data.settings) { 
+          // Merge with defaults to handle new settings fields added in later versions
+          setSettings(prev => ({ ...prev, ...data.settings })); 
+          await saveSettings(data.settings); 
+        }
         if (data.billItems) { setBillItems(data.billItems); await saveBills(data.billItems); }
         if (data.holdingSnapshots) { setHoldingSnapshots(data.holdingSnapshots); await saveHoldings(data.holdingSnapshots); }
-        if (data.divLedger && setDivLedger && saveDivLedger) { setDivLedger(data.divLedger); await saveDivLedger(data.divLedger); }
-        resolve(data);
+        // v2+ backups include divLedger; v1 backups don't have it, so we preserve existing
+        if (data.version >= 2 && data.divLedger && setDivLedger && saveDivLedger) { 
+          setDivLedger(data.divLedger); 
+          await saveDivLedger(data.divLedger); 
+        }
+        resolve({ ...data, wasV1: data.version === 1 });
       } catch(err) { reject(err); }
     };
     reader.onerror = () => reject(new Error("Could not read file"));
@@ -351,6 +360,10 @@ function movingAverage(values, window) {
 // A 50% requirement means E-Trade requires you to maintain equity equal to 50% of that
 // position's value at all times. Standard Reg T minimum is 25%, but E-Trade applies
 // higher house requirements to volatile, leveraged, and options-income securities.
+//
+// LAST VERIFIED: March 2026
+// Requirements can change — verify at E-Trade → Margin → Maintenance Requirements
+// Use the per-position override in Holdings tab if your actual requirement differs.
 const MAINTENANCE_MAP = {
   // ── B1 GROWTH ANCHORS ─────────────────────────────────────────────────────────
   // Broad index ETFs — standard 25%
@@ -764,6 +777,7 @@ function parseETradeCSV(text) {
   };
 
   const positions = [];
+  const warnings = [];
   let totalMV = 0, totalGL = 0, totalEAI = 0;
 
   for (let i = headerIdx + 1; i < lines.length; i++) {
@@ -785,6 +799,16 @@ function parseETradeCSV(text) {
 
     // Cost basis = cost per share × quantity
     const cost  = costSh * qty;
+
+    // Validation: check qty × price ≈ marketValue (within 5% or $10)
+    const calcMV = qty * price;
+    if (mv > 0 && calcMV > 0) {
+      const diff = Math.abs(mv - calcMV);
+      const pctDiff = diff / mv;
+      if (pctDiff > 0.05 && diff > 10) {
+        warnings.push(`${sym}: Value $${mv.toFixed(0)} ≠ Qty×Price $${calcMV.toFixed(0)}`);
+      }
+    }
 
     if (!mv && !qty) continue;
 
@@ -829,6 +853,7 @@ function parseETradeCSV(text) {
     },
     totalEstAnnIncome: totalEAI,
     totalUnrealizedGL: totalGL,
+    parseWarnings: warnings.length > 0 ? warnings : null,
   };
 }
 
@@ -1015,7 +1040,7 @@ function BillModelerTab({ latest, settings }) {
         );})}
       </div>
       <div style={{marginTop:16,padding:"12px 16px",background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusSm,fontSize:11,color:T.amber,lineHeight:1.6}}>
-        <strong>⚠ NAV Erosion Not Modeled:</strong> Freedom Date projections assume portfolio value grows steadily. B3 high-yield positions (WPAY, MSTY, QQQY, etc.) experience NAV erosion — their share price declines over time even as they pay dividends. If your portfolio is B3-heavy, actual freedom may arrive later than projected.
+        <strong>⚠ Projection Limitations:</strong> Freedom Date assumes (1) stable NAV — B3 high-yield positions (WPAY, MSTY, QQQY, etc.) erode over time, and (2) 100% of dividends available for bills — in reality, 15-24% goes to taxes. If your portfolio is B3-heavy or you're in a higher tax bracket, actual freedom may arrive later than projected.
       </div>
     </div>
   );
@@ -1141,7 +1166,15 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings, divL
   const [sortDir, setSortDir] = useState("desc");
   const [filterBucket, setFilterBucket] = useState("All");
   const [marginEntry, setMarginEntry] = useState(""); // for CSV uploads where margin is unknown
-  const [viewMode, setViewMode] = useState("totalReturn"); // 'totalReturn' | 'etrade'
+  const [viewMode, setViewMode] = useState(() => {
+    try { return localStorage.getItem("yieldstack-view-mode") || "totalReturn"; } catch { return "totalReturn"; }
+  }); // 'totalReturn' | 'etrade'
+  
+  // Persist viewMode changes
+  const updateViewMode = (mode) => {
+    setViewMode(mode);
+    try { localStorage.setItem("yieldstack-view-mode", mode); } catch {}
+  };
   const [showDivImport, setShowDivImport] = useState(false);
   const [importText, setImportText] = useState("");
   const [parseResult, setParseResult] = useState(null);
@@ -1416,8 +1449,8 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings, divL
                 </div>
                 {/* View Toggle */}
                 <div style={{ display: "flex", gap: 4, background: T.surfaceAlt, borderRadius: 8, padding: 3 }}>
-                  <button onClick={() => setViewMode("totalReturn")} style={{ padding: "5px 10px", borderRadius: 6, border: "none", background: viewMode === "totalReturn" ? T.green : "transparent", color: viewMode === "totalReturn" ? "#fff" : T.textMuted, fontWeight: 600, fontSize: 11, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s" }}>Total Return</button>
-                  <button onClick={() => setViewMode("etrade")} style={{ padding: "5px 10px", borderRadius: 6, border: "none", background: viewMode === "etrade" ? T.indigo : "transparent", color: viewMode === "etrade" ? "#fff" : T.textMuted, fontWeight: 600, fontSize: 11, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s" }}>E-Trade View</button>
+                  <button onClick={() => updateViewMode("totalReturn")} style={{ padding: "5px 10px", borderRadius: 6, border: "none", background: viewMode === "totalReturn" ? T.green : "transparent", color: viewMode === "totalReturn" ? "#fff" : T.textMuted, fontWeight: 600, fontSize: 11, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s" }}>Total Return</button>
+                  <button onClick={() => updateViewMode("etrade")} style={{ padding: "5px 10px", borderRadius: 6, border: "none", background: viewMode === "etrade" ? T.indigo : "transparent", color: viewMode === "etrade" ? "#fff" : T.textMuted, fontWeight: 600, fontSize: 11, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s" }}>E-Trade View</button>
                 </div>
               </div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -1671,14 +1704,20 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings, divL
                           <th style={{ padding: "8px 12px", textAlign: "center", fontWeight: 700, color: T.textMuted }}>DRIP</th>
                         </tr></thead>
                         <tbody>
-                          {Object.entries(parseResult.byTicker).sort((a,b) => b[1].reduce((s,e)=>s+e.amount,0) - a[1].reduce((s,e)=>s+e.amount,0)).map(([ticker, entries]) => (
+                          {Object.entries(parseResult.byTicker).sort((a,b) => b[1].reduce((s,e)=>s+e.amount,0) - a[1].reduce((s,e)=>s+e.amount,0)).map(([ticker, entries]) => {
+                            const total = entries.reduce((s, e) => s + e.amount, 0);
+                            const hasNegative = entries.some(e => e.amount < 0);
+                            return (
                             <tr key={ticker} style={{ borderTop: `1px solid ${T.borderLight}` }}>
                               <td style={{ padding: "8px 12px", fontWeight: 600 }}>{ticker}</td>
                               <td style={{ padding: "8px 12px", textAlign: "right" }}>{entries.length}</td>
-                              <td style={{ padding: "8px 12px", textAlign: "right", color: T.green, fontWeight: 600 }}>{fmt$(entries.reduce((s, e) => s + e.amount, 0))}</td>
+                              <td style={{ padding: "8px 12px", textAlign: "right", color: total < 0 ? T.red : T.green, fontWeight: 600 }}>
+                                {fmt$(total)}
+                                {hasNegative && <div style={{fontSize:9,color:T.textMuted,fontWeight:400}}>includes ROC adj.</div>}
+                              </td>
                               <td style={{ padding: "8px 12px", textAlign: "center", color: entries[0]?.reinvested ? T.indigo : T.textMuted }}>{entries[0]?.reinvested ? "✓" : "—"}</td>
                             </tr>
-                          ))}
+                          );})}
                         </tbody>
                       </table>
                     </div>
@@ -2328,7 +2367,7 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
       </Card>
       <div style={{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
         <button onClick={apply} style={{padding:"11px 28px",background:T.text,color:"#fff",border:"none",borderRadius:T.radiusXs,fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>Save Settings</button>
-        <button onClick={()=>{setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0"});setSettings(DEFAULT_SETTINGS);setSaveMsg({ok:true,text:"Reset to defaults."});setTimeout(()=>setSaveMsg(null),3000);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
+        <button onClick={()=>{if(!window.confirm("Reset all settings to defaults? This will clear your margin rate and yield settings."))return;setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0"});setSettings(DEFAULT_SETTINGS);setSaveMsg({ok:true,text:"Reset to defaults."});setTimeout(()=>setSaveMsg(null),3000);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
         {saveMsg&&<span style={{fontSize:12,fontWeight:600,color:saveMsg.ok?T.green:T.red}}>{saveMsg.ok?"✓":""} {saveMsg.text}</span>}
       </div>
 
@@ -2388,10 +2427,12 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
 }
 
 // ── HELP PAGE ─────────────────────────────────────────────────────────────────
-function HelpPage() {
+function HelpPage({ settings }) {
   const Term=({term,color=T.text,children})=>(<div style={{marginBottom:10,padding:"12px 16px",background:T.surfaceAlt,border:`1px solid ${T.borderLight}`,borderRadius:T.radiusSm}}><div style={{fontSize:12,fontWeight:700,color,marginBottom:4}}>{term}</div><div style={{fontSize:12,color:T.textSub,lineHeight:1.75}}>{children}</div></div>);
   const Step=({n,children})=>(<div style={{display:"flex",gap:14,marginBottom:12}}><div style={{width:26,height:26,borderRadius:"50%",background:T.text,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,color:"#fff",flexShrink:0,fontWeight:700}}>{n}</div><div style={{fontSize:12,color:T.textSub,lineHeight:1.75,paddingTop:4}}>{children}</div></div>);
   const Note=({icon,children,color=T.textSub,bg=T.surfaceAlt,border=T.border})=>(<div style={{background:bg,border:`1px solid ${border}`,borderRadius:T.radiusSm,padding:"12px 16px",marginBottom:12,display:"flex",gap:10}}><span style={{flexShrink:0}}>{icon}</span><div style={{fontSize:12,color,lineHeight:1.75}}>{children}</div></div>);
+  const yieldPct = settings?.targetYield ? `${(settings.targetYield*100).toFixed(0)}%` : "23%";
+  const ratePct = settings?.marginRate ? `${(settings.marginRate*100).toFixed(2)}%` : "8.44%";
   return(
     <div style={{maxWidth:960,display:"grid",gridTemplateColumns:"1fr 1fr",gap:28}}>
       <div>
@@ -2428,7 +2469,7 @@ function HelpPage() {
         </Card>
         <Card>
           <SectionLabel>KEY NUMBERS</SectionLabel>
-          {[{l:"Trigger equity",v:"60%",c:T.green},{l:"Hard floor",v:"55%",c:T.amber},{l:"Rising streak",v:"2 months",c:T.text},{l:"Forward check",v:"3 months",c:T.blue},{l:"Target yield",v:"23%",c:T.green},{l:"Negotiated rate",v:"8.44%",c:T.red},{l:"Reg T minimum",v:"25%",c:T.textSub},{l:"True maint. (your port.)",v:"See Holdings tab",c:T.red}].map(({l,v,c})=>(<div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:`1px solid ${T.borderLight}`}}><span style={{fontSize:12,color:T.text}}>{l}</span><span style={{fontSize:15,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</span></div>))}
+          {[{l:"Trigger equity",v:"60%",c:T.green},{l:"Hard floor",v:"55%",c:T.amber},{l:"Rising streak",v:"2 months",c:T.text},{l:"Forward check",v:"3 months",c:T.blue},{l:"Target yield",v:yieldPct,c:T.green},{l:"Margin rate",v:ratePct,c:T.red},{l:"Reg T minimum",v:"25%",c:T.textSub},{l:"True maint. (your port.)",v:"See Holdings tab",c:T.red}].map(({l,v,c})=>(<div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:`1px solid ${T.borderLight}`}}><span style={{fontSize:12,color:T.text}}>{l}</span><span style={{fontSize:15,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</span></div>))}
           <div style={{marginTop:16}}><SectionLabel>WHERE TO FIND YOUR NUMBERS</SectionLabel>
             {[{l:"Gross (Total Assets)",w:"Balance Sheet → Total Assets"},{l:"Margin Loan",w:"Balance Sheet → Cash, BDP, MMFs (Debit)"},{l:"Monthly Deposits",w:"Cash Flow → Electronic Transfers-Credits (This Period)"},{l:"Bills Floated",w:"Debit Card & Checking Activity → Total Automated Payments"},{l:"Actual Dividends",w:"Income and Distribution Summary → Total Income"},{l:"Actual Interest",w:"Margin Loan Interest Schedule → Total Interest"},{l:"Your Margin Rate",w:"Margin Loan Interest Schedule → Interest Rate %"}].map(({l,w})=>(<div key={l} style={{padding:"9px 12px",background:T.surfaceAlt,borderRadius:T.radiusXs,marginBottom:6}}><div style={{fontSize:11,fontWeight:600,color:T.text}}>{l}</div><div style={{fontSize:11,color:T.textMuted,marginTop:2}}>→ {w}</div></div>))}
           </div>
@@ -2652,7 +2693,18 @@ export default function App() {
   const monthsToTrigger=equityMomAvg>0&&currentSnapshot&&!cond1?Math.ceil((0.60-currentSnapshot.equity)/equityMomAvg):null;
   const eqColor=(eq)=>eq>=0.60?T.green:eq>=0.55?T.amber:T.red;
 
-  const openAdd=()=>{setEditIdx(null);setForm({gross:"",margin:"",w2:"",bills:"",actualDivs:"",actualInterest:"",actualATW:"",date:new Date().toISOString().slice(0,7)});setPdfStatus(null);setSaveError(null);setShowAdd(true);};
+  const openAdd=()=>{
+    setEditIdx(null);
+    setForm({
+      gross:"",
+      margin:"",
+      w2:latest?String(latest.w2):"", // Pre-fill from last log
+      bills:floatedBillsTotal>0?String(floatedBillsTotal):"", // Pre-fill from Bill Tracker
+      actualDivs:"",actualInterest:"",actualATW:"",
+      date:new Date().toISOString().slice(0,7)
+    });
+    setPdfStatus(null);setSaveError(null);setShowAdd(true);
+  };
   const openEdit=(idx)=>{const e=entries[idx];setEditIdx(idx);setForm({gross:String(e.gross),margin:String(e.margin),w2:String(e.w2),bills:String(e.bills),actualDivs:e.actualDivs!=null?String(e.actualDivs):"",actualInterest:e.actualInterest!=null?String(e.actualInterest):"",actualATW:e.actualATW!=null?String(e.actualATW):"",date:e.date});setPdfStatus(null);setSaveError(null);setShowAdd(true);};
   // Pre-fill log modal from latest holdings snapshot
   const openLogFromHoldings=()=>{
@@ -2662,7 +2714,7 @@ export default function App() {
       gross:String(latestHoldings.totalAssets||""),
       margin:String(latestHoldings.marginLoan||latest?.margin||0),
       w2:latest?String(latest.w2):"",
-      bills:latest?String(latest.bills):"",
+      bills:floatedBillsTotal>0?String(floatedBillsTotal):(latest?String(latest.bills):""), // Prefer Bill Tracker
       actualDivs:"",actualInterest:"",actualATW:"",
       date:new Date().toISOString().slice(0,7),
     });
@@ -2892,7 +2944,7 @@ export default function App() {
                 <div style={{marginBottom:14,display:"flex",alignItems:"center",gap:8,fontSize:12,color:T.textSub}}>Next bill:<input value={nextBill} onChange={e=>setNextBill(e.target.value)} style={{width:76,padding:"6px 10px",background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,fontWeight:700,color:T.text,fontFamily:"inherit",outline:"none",textAlign:"right"}}/><span>/mo</span></div>
                 {[
                   {pass:cond1,hd:!!currentSnapshot,label:"Equity ≥ 60%",sub:currentSnapshot?`Currently ${fmtPct(currentSnapshot.equity)}`:"No data yet"},
-                  {pass:cond2,hd:computed.length>1,label:"Rising 2+ months",sub:computed.length<2?"Need 2+ monthly log entries to evaluate streak":risingStreak>=2?"Confirmed uptrend ✓":`${risingStreak} of 2 consecutive months rising`,badge:risingStreak>0?`↑ ${risingStreak}mo`:null},
+                  {pass:cond2,hd:computed.length>1,label:"Rising 2+ months",sub:computed.length<2?"Need 2+ monthly log entries":risingStreak>=2?"Confirmed uptrend ✓ (from logs)":`${risingStreak} of 2 months rising (log-based)`,badge:risingStreak>0?`↑ ${risingStreak}mo`:null},
                   {pass:cond3,hd:!!currentSnapshot,label:"3-month floor ≥ 55%",sub:currentSnapshot?`Projected min: ${fmtPct(projectMinEquity(currentSnapshot.gross,currentSnapshot.margin,currentSnapshot.effectiveDivs,currentSnapshot.w2+nextBillAmt,currentSnapshot.bills+nextBillAmt,settings.marginRate,effectiveYield,3))}`:"No data yet"},
                 ].map(({pass,hd,label,sub,badge})=>(
                   <div key={label} style={{display:"flex",gap:12,padding:"12px 14px",borderRadius:T.radiusSm,marginBottom:8,background:!hd?T.surfaceAlt:pass?T.greenBg:T.redBg,border:`1px solid ${!hd?T.border:pass?T.greenBorder:T.redBorder}`}}>
@@ -3068,7 +3120,7 @@ export default function App() {
         )}
 
         {activeTab==="settings"&&<SettingsTab settings={fullSettings} setSettings={setSettings} derivedYield={derivedYield} hasActualData={entries.some(e=>e.actualDivs!=null&&e.actualDivs!=="")} holdingsYield={holdingsYield} hasHoldings={holdingSnapshots.length>0} onExport={handleExport} onImport={handleImport} importStatus={importStatus}/>}
-        {activeTab==="help"&&<HelpPage/>}
+        {activeTab==="help"&&<HelpPage settings={fullSettings}/>}
       </div>
 
       {/* Log / Edit Modal */}
