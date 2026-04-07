@@ -6,7 +6,7 @@ const BILLS_KEY     = "p2p-bills-v1";
 const HOLDINGS_KEY  = "p2p-holdings-v1";
 const DIVLEDGER_KEY = "p2p-divledger-v1";
 
-const DEFAULT_SETTINGS = { marginRate: 0.0844, targetYield: 0.23, yieldMode: "manual", dripTickers: ["CLM", "CRF", "GOF", "ECAT", "SPYG"] };
+const DEFAULT_SETTINGS = { marginRate: 0.0844, targetYield: 0.23, yieldMode: "manual", dripTickers: ["CLM", "CRF", "GOF", "ECAT", "SPYG"], defaultW2: 871 };
 
 const parseNum = (s) => { const n = parseFloat(String(s).replace(/,/g, "")); return isNaN(n) ? 0 : n; };
 const fmt$ = (v, dec = 2) => "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec });
@@ -2275,7 +2275,7 @@ function StressTestTab({ latest, settings, positions }) {
 
 // ── SETTINGS TAB ──────────────────────────────────────────────────────────────
 function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdingsYield, hasHoldings, onExport, onImport, importStatus }) {
-  const [local, setLocal] = useState({ ...settings, marginRateStr: (settings.marginRate*100).toFixed(2), targetYieldStr: (settings.targetYield*100).toFixed(1) });
+  const [local, setLocal] = useState({ ...settings, marginRateStr: (settings.marginRate*100).toFixed(2), targetYieldStr: (settings.targetYield*100).toFixed(1), defaultW2Str: String(settings.defaultW2 ?? 871) });
   const [sbUrl, setSbUrl] = useState(() => store.getSupabaseConfig()?.url || "");
   const [sbKey, setSbKey] = useState(() => store.getSupabaseConfig()?.anonKey || "");
   const [sbStatus, setSbStatus] = useState(store.getSupabaseConfig() ? "connected" : null);
@@ -2285,9 +2285,11 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
   const apply = () => {
     const mr=parseNum(local.marginRateStr)/100;
     const ty=parseNum(local.targetYieldStr)/100;
+    const dw2=parseNum(local.defaultW2Str);
     if(mr<=0||mr>=1){setSaveMsg({ok:false,text:"Margin rate must be between 0% and 100%."});return;}
     if(ty<=0||ty>=2){setSaveMsg({ok:false,text:"Yield must be between 0% and 200%."});return;}
-    setSettings(s=>({...s,marginRate:mr,targetYield:ty,yieldMode:local.yieldMode}));
+    if(dw2<=0){setSaveMsg({ok:false,text:"Monthly deposit must be greater than $0."});return;}
+    setSettings(s=>({...s,marginRate:mr,targetYield:ty,yieldMode:local.yieldMode,defaultW2:dw2}));
     setSaveMsg({ok:true,text:"Settings saved."});
     setTimeout(()=>setSaveMsg(null),3000);
   };
@@ -2320,6 +2322,19 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
           <div style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"14px 18px",minWidth:160,textAlign:"center"}}>
             <div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:6}}>CURRENT SETTING</div>
             <div style={{fontSize:32,fontWeight:700,color:T.red,fontFamily:"'Lora', serif"}}>{(settings.marginRate*100).toFixed(2)}%</div>
+          </div>
+        </div>
+      </Card>
+      <Card>
+        <SectionLabel>PROJECTION DEPOSIT</SectionLabel>
+        <div style={{display:"flex",gap:20,alignItems:"flex-end",flexWrap:"wrap"}}>
+          <div style={{flex:1,minWidth:200}}>
+            <Input label="Monthly deposit (used in all projections)" hint="($)" value={local.defaultW2Str} onChange={e=>setLocal(l=>({...l,defaultW2Str:e.target.value}))} placeholder="e.g. 871"/>
+            <div style={{marginTop:8,fontSize:11,color:T.textMuted,lineHeight:1.6}}>Used by Freedom Date, Bill Modeler, and Conditions Checker. Set this to your actual recurring monthly transfer. Overrides the last log entry so projections stay accurate even when logs are stale.</div>
+          </div>
+          <div style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"14px 18px",minWidth:160,textAlign:"center"}}>
+            <div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:6}}>CURRENT SETTING</div>
+            <div style={{fontSize:32,fontWeight:700,color:T.green,fontFamily:"'Lora', serif"}}>{fmt$(settings.defaultW2 ?? 871, 0)}</div>
           </div>
         </div>
       </Card>
@@ -2367,7 +2382,7 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
       </Card>
       <div style={{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
         <button onClick={apply} style={{padding:"11px 28px",background:T.text,color:"#fff",border:"none",borderRadius:T.radiusXs,fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>Save Settings</button>
-        <button onClick={()=>{if(!window.confirm("Reset all settings to defaults? This will clear your margin rate and yield settings."))return;setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0"});setSettings(DEFAULT_SETTINGS);setSaveMsg({ok:true,text:"Reset to defaults."});setTimeout(()=>setSaveMsg(null),3000);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
+        <button onClick={()=>{if(!window.confirm("Reset all settings to defaults? This will clear your margin rate and yield settings."))return;setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0",defaultW2Str:"871"});setSettings(DEFAULT_SETTINGS);setSaveMsg({ok:true,text:"Reset to defaults."});setTimeout(()=>setSaveMsg(null),3000);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
         {saveMsg&&<span style={{fontSize:12,fontWeight:600,color:saveMsg.ok?T.green:T.red}}>{saveMsg.ok?"✓":""} {saveMsg.text}</span>}
       </div>
 
@@ -2635,7 +2650,7 @@ export default function App() {
       const monthlyEAI = latestHoldings.totalEstAnnIncome
         ? latestHoldings.totalEstAnnIncome / 12
         : g * effectiveYield / 12;
-      const w2 = latest?.w2 || 0;
+      const w2 = settings.defaultW2 || latest?.w2 || 0;
       const bills = liveBills;
       const estimatedInterest = m * settings.marginRate / 12;
       const coverage = bills > 0 ? monthlyEAI / bills : 0;
@@ -2664,6 +2679,7 @@ export default function App() {
     // Fallback: log data only — still use live bills if Bill Tracker is configured
     return latest ? {
       ...latest,
+      w2: settings.defaultW2 || latest.w2 || 0,
       bills: liveBills,
       coverage: liveBills > 0 ? (latest.effectiveDivs || 0) / liveBills : 0,
       trueNetDraw: Math.max(0, liveBills + (latest.effectiveInterest || 0) - (latest.effectiveDivs || 0)),
@@ -2673,7 +2689,7 @@ export default function App() {
       weightedMaintRate: DEFAULT_MAINTENANCE_REQ,
       actualATW: latest?.actualATW ?? null,
     } : null;
-  }, [latest, latestHoldings, effectiveYield, settings.marginRate, billItems]);
+  }, [latest, latestHoldings, effectiveYield, settings.marginRate, settings.defaultW2, billItems]);
   const nextBillAmt=parseNum(nextBill)||200;
   let risingStreak=0; for(let i=computed.length-1;i>=1;i--){if(computed[i].rising)risingStreak++;else break;}
   // Conditions: cond1 uses currentSnapshot equity (most current), cond2 uses log streak, cond3 uses currentSnapshot for projections
