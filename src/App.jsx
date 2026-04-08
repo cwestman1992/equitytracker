@@ -1899,6 +1899,280 @@ function DividendsTab({ computed }) {
   );
 }
 
+// ── CAPITAL DEPLOYMENT OPTIMIZER ──────────────────────────────────────────────
+function DeployTab({ latest, settings }) {
+  const COLORS = [T.greenMid, T.blueMid, T.violet];
+  const MONTHS = 12;
+  const [amounts, setAmounts] = useState(["1000","2500","5000"]);
+  const [labels, setLabels] = useState(["Conservative","Moderate","Aggressive"]);
+
+  if (!latest) return (
+    <Card><div style={{textAlign:"center",padding:40,color:T.textMuted}}>
+      <div style={{fontSize:32,marginBottom:12}}>🚀</div>
+      <div style={{fontSize:14,fontWeight:600,color:T.textSub,marginBottom:8}}>Log at least one month to use the Deployment Optimizer</div>
+      <div style={{fontSize:12,lineHeight:1.7}}>This tool needs your portfolio balance and margin from a log entry or holdings snapshot. Once you have data, it will calculate safe deployment limits and model the Freedom Date impact of each scenario.</div>
+    </div></Card>
+  );
+
+  const { gross, margin, effectiveDivs, w2, bills } = latest;
+  const { marginRate, effectiveYield } = settings;
+  const spreadPct = Math.max(0, effectiveYield - marginRate);
+
+  // Safe margin deployment limits — max you can borrow to invest and still stay above the floor
+  // over the NEXT 12 MONTHS (not just a one-time crash snapshot).
+  // Simulates: gross += amt, margin += amt, then runs projectMinEquity over 12 months.
+  // This answers: "will I stay safe over time?" — not just "am I safe on day 1 if the market crashes?"
+  const calcSafeLimit = (floor) => {
+    let lo = 0, hi = 500000;
+    for (let i = 0; i < 60; i++) {
+      const mid = (lo + hi) / 2;
+      const minEq = projectMinEquity(gross + mid, margin + mid, effectiveDivs, w2, bills, marginRate, effectiveYield, 12);
+      if (minEq >= floor) lo = mid; else hi = mid;
+    }
+    return Math.max(0, Math.floor(lo / 50) * 50);
+  };
+  const conservativeLimit = calcSafeLimit(0.60);
+  const aggressiveLimit   = calcSafeLimit(0.55);
+
+  // Base freedom date (no additional deployment)
+  const baseFreedom = projectFreedomMonths(gross, margin, effectiveDivs, w2, bills, marginRate, effectiveYield);
+
+  const scenarios = useMemo(() => {
+    return amounts.map((amtStr, i) => {
+      const amt = parseNum(amtStr) || 0;
+      const dg = gross + amt;
+      const dm = margin + amt;
+      const postEquity   = dg > 0 ? (dg - dm) / dg : 0;
+      const stressGross  = dg * 0.85;
+      const stressEquity = stressGross > 0 ? (stressGross - dm) / stressGross : 0;
+      const monthlySpread = amt * spreadPct / 12;
+      const curve        = projectCurve(dg, dm, effectiveDivs, w2, bills, marginRate, effectiveYield, MONTHS);
+      const minEquity    = Math.min(...curve.map(p => p.equity));
+      const freedom      = projectFreedomMonths(dg, dm, effectiveDivs, w2, bills, marginRate, effectiveYield);
+      const freedomDelta = (baseFreedom != null && freedom != null) ? baseFreedom - freedom : null;
+      const stressColor  = stressEquity >= 0.60 ? T.green : stressEquity >= 0.55 ? T.amber : T.red;
+      const stressBg     = stressEquity >= 0.60 ? T.greenBg : stressEquity >= 0.55 ? T.amberBg : T.redBg;
+      const stressBorder = stressEquity >= 0.60 ? T.greenBorder : stressEquity >= 0.55 ? T.amberBorder : T.redBorder;
+      const stressSafe   = stressEquity >= 0.55;
+      const withinConservative = amt <= conservativeLimit;
+      const withinAggressive   = amt <= aggressiveLimit;
+      return { amt, label: labels[i], postEquity, stressEquity, stressColor, stressBg, stressBorder, stressSafe, monthlySpread, curve, minEquity, freedom, freedomDelta, withinConservative, withinAggressive };
+    });
+  }, [amounts, labels, gross, margin, effectiveDivs, w2, bills, marginRate, effectiveYield, spreadPct, conservativeLimit, aggressiveLimit, baseFreedom]);
+
+  const eqColor = (eq) => eq >= 0.60 ? T.green : eq >= 0.55 ? T.amber : T.red;
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:20}}>
+
+      {/* Current State */}
+      <Card style={{padding:"16px 24px"}}>
+        <SectionLabel>{latest.fromHoldings ? "CURRENT STATE — FROM HOLDINGS SNAPSHOT" : "CURRENT STATE — FROM LATEST LOG"}</SectionLabel>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:latest.margin > 0 ? 0 : 12}}>
+          {[
+            {l:"Gross",      v:fmt$(gross),                          c:T.text},
+            {l:"Margin",     v:fmt$(margin),                         c:margin>0?T.red:T.textMuted},
+            {l:"Equity",     v:fmtPct(latest.equity),                c:eqColor(latest.equity)},
+            {l:"Divs / Mo",  v:fmt$(effectiveDivs),                  c:T.green},
+            {l:"Yield Spread",v:`+${fmtPct(spreadPct,1)}/yr`,        c:spreadPct>0?T.green:T.red},
+          ].map(({l,v,c})=>(
+            <div key={l} style={{textAlign:"center"}}>
+              <div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:4}}>{l}</div>
+              <div style={{fontSize:14,fontWeight:700,color:c}}>{v}</div>
+            </div>
+          ))}
+        </div>
+        {margin <= 0 && (
+          <div style={{marginTop:4,padding:"8px 12px",background:T.blueBg,border:`1px solid ${T.blueBorder}`,borderRadius:T.radiusXs,fontSize:11,color:T.blue,lineHeight:1.6}}>
+            <strong>You're at $0 margin — under-leveraged relative to P2P system capacity.</strong> The scenarios below show the impact of deploying additional capital via margin borrowing. Your yield spread of {fmtPct(spreadPct,1)} means every $1 borrowed generates {fmt$(spreadPct/12,3)}/mo in net income above borrowing cost.
+          </div>
+        )}
+        {latest.actualATW != null && (
+          <div style={{marginTop:4,padding:"8px 12px",background:T.greenBg,border:`1px solid ${T.greenBorder}`,borderRadius:T.radiusXs,fontSize:11,color:T.green,lineHeight:1.6,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div><strong>E-Trade Available to Withdraw: {fmt$(latest.actualATW)}</strong> — logged actual. Your safe limits above should not exceed this.</div>
+            {aggressiveLimit > latest.actualATW && <span style={{fontWeight:700,color:T.amber}}>⚠ Aggressive limit exceeds E-Trade ATW</span>}
+          </div>
+        )}
+        {latest.actualATW == null && (
+          <div style={{marginTop:4,padding:"8px 12px",background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusXs,fontSize:11,color:T.amber,lineHeight:1.6}}>
+            <strong>No E-Trade ATW logged.</strong> Log your actual Available to Withdraw (E-Trade → Accounts → Balances) when saving a monthly entry to see how your safe limits compare to what E-Trade will actually allow.
+          </div>
+        )}
+      </Card>
+
+      {/* Safe Deployment Limits */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+        <div style={{background:T.greenBg,border:`1px solid ${T.greenBorder}`,borderRadius:T.radius,padding:"18px 24px"}}>
+          <div style={{fontSize:10,fontWeight:700,letterSpacing:"1.5px",color:T.green,marginBottom:4}}>CONSERVATIVE LIMIT — STAYS ABOVE 60% FOR 12 MONTHS</div>
+          <div style={{display:"flex",alignItems:"baseline",gap:8}}>
+            <div style={{fontSize:36,fontWeight:700,color:T.green,fontFamily:"'Lora', serif"}}>{conservativeLimit > 0 ? fmt$(conservativeLimit, 0) : "—"}</div>
+            {conservativeLimit > 0 && <div style={{fontSize:13,color:T.textMuted}}>max via margin</div>}
+          </div>
+          <div style={{fontSize:11,color:T.textSub,marginTop:4}}>
+            {conservativeLimit > 0
+              ? `Projects minimum equity above 60% over the next 12 months`
+              : "No headroom above 60% over 12 months at current state"}
+          </div>
+        </div>
+        <div style={{background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radius,padding:"18px 24px"}}>
+          <div style={{fontSize:10,fontWeight:700,letterSpacing:"1.5px",color:T.amber,marginBottom:4}}>AGGRESSIVE LIMIT — STAYS ABOVE 55% FOR 12 MONTHS</div>
+          <div style={{display:"flex",alignItems:"baseline",gap:8}}>
+            <div style={{fontSize:36,fontWeight:700,color:T.amber,fontFamily:"'Lora', serif"}}>{aggressiveLimit > 0 ? fmt$(aggressiveLimit, 0) : "—"}</div>
+            {aggressiveLimit > 0 && <div style={{fontSize:13,color:T.textMuted}}>max via margin</div>}
+          </div>
+          <div style={{fontSize:11,color:T.textSub,marginTop:4}}>
+            {aggressiveLimit > 0
+              ? `Projects minimum equity above 55% hard floor over 12 months`
+              : "No headroom above 55% hard floor over 12 months"}
+          </div>
+        </div>
+      </div>
+
+      {/* Scenario Builder */}
+      <Card>
+        <SectionLabel>DEPLOYMENT SCENARIO BUILDER</SectionLabel>
+        <div style={{fontSize:12,color:T.textSub,marginBottom:16,lineHeight:1.6}}>
+          Each scenario models deploying additional capital via margin. The safe limits above are based on 12-month equity projections. The stress test column in each card shows the additional one-time crash scenario — useful context, but the limits are driven by the sustained projection, not the crash.
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:20}}>
+          {scenarios.map((s, i) => {
+            // Mini SVG chart — 12 months
+            const W=200,H=78,pad={t:6,b:16,l:26,r:6};
+            const iW=W-pad.l-pad.r,iH=H-pad.t-pad.b;
+            const allEqs=s.curve.map(p=>p.equity);
+            const eMin=Math.max(0,Math.min(...allEqs)-0.05),eMax=Math.min(1,Math.max(...allEqs)+0.05);
+            const eSpan=Math.max(eMax-eMin,0.05);
+            const toX=(idx)=>pad.l+(idx/(s.curve.length-1))*iW;
+            const toY=(v)=>pad.t+iH-((Math.min(1,Math.max(0,v))-eMin)/eSpan)*iH;
+            const linePath="M"+s.curve.map((p,idx)=>`${toX(idx)},${toY(p.equity)}`).join(" L");
+            return (
+              <div key={i} style={{borderRadius:T.radiusSm,padding:"16px",background:T.surfaceAlt,border:`1.5px solid ${s.stressSafe?T.border:T.redBorder}`}}>
+                {/* Header */}
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+                  <div style={{width:10,height:10,borderRadius:"50%",background:COLORS[i],flexShrink:0}}/>
+                  <div style={{fontSize:12,fontWeight:700,color:COLORS[i],flex:1}}>
+                    <input value={labels[i]} onChange={e=>{const n=[...labels];n[i]=e.target.value;setLabels(n);}} style={{background:"transparent",border:"none",color:COLORS[i],fontWeight:700,fontSize:12,fontFamily:"inherit",width:"100%",outline:"none",padding:0}}/>
+                  </div>
+                  <Badge color={s.stressSafe?T.green:T.red} bg={s.stressSafe?T.greenBg:T.redBg} border={s.stressSafe?T.greenBorder:T.redBorder}>{s.stressSafe?"SAFE":"UNSAFE"}</Badge>
+                </div>
+
+                {/* Amount input */}
+                <div style={{marginBottom:14}}>
+                  <div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:4}}>DEPLOY VIA MARGIN</div>
+                  <div style={{display:"flex",alignItems:"center",gap:6}}>
+                    <span style={{fontSize:14,color:T.textSub,fontWeight:600}}>$</span>
+                    <input
+                      value={amounts[i]}
+                      onChange={e=>{const n=[...amounts];n[i]=e.target.value;setAmounts(n);}}
+                      style={{width:"100%",padding:"7px 10px",background:T.surface,border:`1.5px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:15,fontWeight:700,color:T.text,fontFamily:"'Lora',serif",outline:"none"}}
+                      placeholder="0"
+                    />
+                  </div>
+                  {s.amt > 0 && (
+                    <div style={{fontSize:10,color:T.textMuted,marginTop:4}}>
+                      {s.withinConservative ? "✓ Within conservative limit" : s.withinAggressive ? "⚠ Within aggressive limit only" : "✗ Exceeds both safe limits"}
+                    </div>
+                  )}
+                </div>
+
+                {/* Key metrics */}
+                <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:14}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:11,color:T.textMuted}}>Post-deploy equity</span>
+                    <span style={{fontSize:13,fontWeight:700,color:eqColor(s.postEquity)}}>{fmtPct(s.postEquity)}</span>
+                  </div>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:11,color:T.textMuted}}>After 15% crash</span>
+                    <span style={{fontSize:13,fontWeight:700,color:s.stressColor,padding:"1px 8px",background:s.stressBg,borderRadius:10,border:`1px solid ${s.stressBorder}`}}>{fmtPct(s.stressEquity)}</span>
+                  </div>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:11,color:T.textMuted}}>Net spread / mo</span>
+                    <span style={{fontSize:13,fontWeight:700,color:s.monthlySpread>0?T.green:T.textMuted}}>{s.monthlySpread>0?`+${fmt$(s.monthlySpread,0)}`:"—"}</span>
+                  </div>
+                  <div style={{height:1,background:T.border,margin:"2px 0"}}/>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:11,color:T.textMuted}}>Freedom Date</span>
+                    <span style={{fontSize:12,fontWeight:700,color:T.text}}>{s.freedom ? getFreedomDate(s.freedom) : "—"}</span>
+                  </div>
+                  {s.freedomDelta !== null && (
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <span style={{fontSize:11,color:T.textMuted}}>vs no deployment</span>
+                      <span style={{fontSize:12,fontWeight:700,color:s.freedomDelta>0?T.green:s.freedomDelta<0?T.red:T.textMuted}}>
+                        {s.freedomDelta>0?`−${s.freedomDelta} mo earlier`:s.freedomDelta<0?`+${Math.abs(s.freedomDelta)} mo later`:"No change"}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Mini 12-month chart */}
+                <div style={{borderTop:`1px solid ${T.border}`,paddingTop:10}}>
+                  <div style={{fontSize:9,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:4}}>12-MONTH EQUITY TRAJECTORY</div>
+                  <svg width={W} height={H} style={{width:"100%",height:"auto"}}>
+                    {[0.60,0.55].map(v=>{
+                      if(v<eMin-0.01||v>eMax+0.01)return null;
+                      return <g key={v}>
+                        <line x1={pad.l} x2={pad.l+iW} y1={toY(v)} y2={toY(v)} stroke={v===0.60?T.greenMid:T.amberMid} strokeWidth={1} strokeDasharray="4,3" opacity={0.7}/>
+                        <text x={pad.l-3} y={toY(v)+4} textAnchor="end" fill={v===0.60?T.greenMid:T.amberMid} fontSize="7" fontFamily="Nunito" fontWeight="700">{v*100}%</text>
+                      </g>;
+                    })}
+                    {[0,6,12].map(m=>(
+                      <text key={m} x={toX(m)} y={H-2} textAnchor="middle" fill={T.textMuted} fontSize="7" fontFamily="Nunito">{m===0?"Now":`${m}mo`}</text>
+                    ))}
+                    <path d={linePath+` L${toX(s.curve.length-1)},${pad.t+iH} L${toX(0)},${pad.t+iH} Z`} fill={COLORS[i]} opacity={0.08}/>
+                    <path d={linePath} fill="none" stroke={COLORS[i]} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                    {[0,6,12].filter(m=>m<s.curve.length).map(m=>(
+                      <circle key={m} cx={toX(m)} cy={toY(s.curve[m].equity)} r="3" fill={COLORS[i]} stroke={T.surface} strokeWidth="1.5"/>
+                    ))}
+                  </svg>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      {/* Suggested B1/B2/B3 Allocation */}
+      <Card>
+        <SectionLabel>SUGGESTED ALLOCATION — WHERE TO PUT DEPLOYED CAPITAL</SectionLabel>
+        <div style={{fontSize:12,color:T.textSub,marginBottom:16,lineHeight:1.6}}>
+          At your current stage (early accumulation, building income), prioritize B3 for maximum dividend generation. The yield spread only works when capital is in high-yield positions.
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
+          {[
+            {bucket:"B1",label:"Growth Anchors",icon:"📈",pct:0.15,color:T.blue,bg:T.blueBg,border:T.blueBorder,note:"SPYG, TQQQ — NAV stability, long-term appreciation"},
+            {bucket:"B2",label:"CEF Compounders",icon:"🏦",pct:0.15,color:T.violet,bg:T.violetBg,border:T.violetBorder,note:"CLM, CRF — DRIP at NAV discount, steady compounding"},
+            {bucket:"B3",label:"High-Yield Workhorses",icon:"⚡",pct:0.70,color:T.green,bg:T.greenBg,border:T.greenBorder,note:"QDTE, XDTE, QQQI — maximum income generation"},
+          ].map(({bucket,label,icon,pct,color,bg,border,note})=>{
+            const deployAmt = parseNum(amounts[1]) || 0; // Use middle scenario as reference
+            const allocated = deployAmt * pct;
+            return (
+              <div key={bucket} style={{background:bg,border:`1px solid ${border}`,borderRadius:T.radiusSm,padding:"16px"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                  <span style={{fontSize:18}}>{icon}</span>
+                  <div>
+                    <div style={{fontSize:11,fontWeight:700,color,letterSpacing:"0.5px"}}>{bucket} — {label}</div>
+                  </div>
+                </div>
+                <div style={{fontSize:28,fontWeight:700,color,fontFamily:"'Lora',serif",marginBottom:4}}>{fmtPct(pct,0)}</div>
+                {deployAmt > 0 && <div style={{fontSize:12,fontWeight:600,color,marginBottom:6}}>{fmt$(allocated,0)} of {fmt$(deployAmt,0)}</div>}
+                <div style={{fontSize:11,color:T.textSub,lineHeight:1.5}}>{note}</div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{marginTop:12,padding:"10px 14px",background:T.surfaceAlt,borderRadius:T.radiusXs,fontSize:11,color:T.textSub,lineHeight:1.6}}>
+          <strong style={{color:T.text}}>Note:</strong> These are starting-point guidelines, not hard rules. Adjust based on your current bucket weights in the Holdings tab. B3 allocation assumes you're comfortable with NAV erosion as a feature — these positions trade price stability for income.
+        </div>
+      </Card>
+
+      {/* Projection caveat */}
+      <div style={{padding:"12px 16px",background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusSm,fontSize:11,color:T.amber,lineHeight:1.7}}>
+        <strong>⚠ Projection Limitations:</strong> Freedom Date calculations assume stable NAV (B3 positions erode over time) and that 100% of dividends are available (pre-tax). Stress test models a one-time 15% crash immediately after deployment — actual drawdowns vary. Use these numbers as relative comparisons, not precise predictions.
+      </div>
+    </div>
+  );
+}
+
 // ── STRESS TEST ───────────────────────────────────────────────────────────────
 function RecoveryChart({ postCrashGross, margin, divs, w2, bills, marginRate, yield_, precrashEquity }) {
   const W=600,H=160,pad={t:16,r:24,b:28,l:48};const iW=W-pad.l-pad.r,iH=H-pad.t-pad.b;
@@ -2018,7 +2292,7 @@ function StressTestTab({ latest, settings, positions }) {
         <div style={{background:T.indigoBg,border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusSm,padding:"12px 18px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
           <div>
             <div style={{fontSize:11,fontWeight:700,color:T.indigo,marginBottom:2}}>📊 Using position-level maintenance requirements — accurate E-Trade math</div>
-            <div style={{fontSize:11,color:T.textSub}}>Weighted blended maintenance rate: <strong style={{color:T.indigo}}>{fmtPct(weightedMaintRate,1)}</strong> · Available to Withdraw: <strong style={{color:T.indigo}}>{fmt$(availableToWithdraw)}</strong>{callDropDelta!==null&&callDropDelta>0.5&&<span style={{color:T.red}}> · Flat 25% estimate was <strong>{callDropDelta.toFixed(1)}% too optimistic</strong> on margin call</span>}</div>
+            <div style={{fontSize:11,color:T.textSub}}>Weighted blended maintenance rate: <strong style={{color:T.indigo}}>{fmtPct(weightedMaintRate,1)}</strong> · Model ATW (for margin call math): <strong style={{color:T.indigo}}>{fmt$(availableToWithdraw)}</strong>{callDropDelta!==null&&callDropDelta>0.5&&<span style={{color:T.red}}> · Flat 25% estimate was <strong>{callDropDelta.toFixed(1)}% too optimistic</strong> on margin call</span>}</div>
           </div>
           <button onClick={()=>setShowMaintBreakdown(v=>!v)} style={{fontSize:11,fontWeight:700,color:T.indigo,background:"none",border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusXs,padding:"5px 12px",fontFamily:"inherit",cursor:"pointer",whiteSpace:"nowrap"}}>{showMaintBreakdown?"Hide":"Show"} Breakdown</button>
         </div>
@@ -2039,7 +2313,7 @@ function StressTestTab({ latest, settings, positions }) {
             {[
               {l:"Weighted Maint. Rate",v:fmtPct(weightedMaintRate,1),c:weightedMaintRate>0.40?T.red:weightedMaintRate>0.30?T.amber:T.green,sub:"vs flat 25% Reg T"},
               {l:"Maintenance Req. $",v:fmt$(maintenanceDollars),c:T.red,sub:"must always be covered"},
-              {l:"Available to Withdraw",v:fmt$(latest?.actualATW??availableToWithdraw),c:(latest?.actualATW??availableToWithdraw)>500?T.green:(latest?.actualATW??availableToWithdraw)>0?T.amber:T.red,sub:latest?.actualATW!=null?`Model: ${fmt$(availableToWithdraw)} · Δ ${fmt$(latest.actualATW-availableToWithdraw)}`:"Rough model — log actual ATW for accuracy"},
+              {l:"Available to Withdraw",v:latest?.actualATW!=null?fmt$(latest.actualATW):fmt$(availableToWithdraw),c:latest?.actualATW!=null?((latest.actualATW>500?T.green:T.amber)):T.indigo,sub:latest?.actualATW!=null?`Logged actual · Model est: ${fmt$(availableToWithdraw)}`:"Model estimate — log actual in History tab"},
               {l:"True Call Threshold",v:isFinite(trueMarginCallDrop)?`−${trueMarginCallDrop.toFixed(1)}%`:"∞",c:isFinite(trueMarginCallDrop)&&trueMarginCallDrop<20?T.red:T.green,sub:`vs −${isFinite(flatCallDrop)?flatCallDrop.toFixed(1):"∞"}% flat 25%`},
             ].map(({l,v,c,sub})=>(
               <div key={l} style={{background:T.surfaceAlt,borderRadius:T.radiusSm,padding:"14px 16px",border:`1px solid ${T.borderLight}`}}>
@@ -2110,7 +2384,7 @@ function StressTestTab({ latest, settings, positions }) {
               {l:"Equity",v:fmtPct(precrashEquity),c:precrashEquity>=0.60?"#6EE7B7":"#FCD34D"},
               {l:"Gross",v:fmt$(gross),c:"#fff"},
               {l:"Margin",v:fmt$(margin),c:margin>0?"#FCA5A5":"#6EE7B7"},
-              {l:"Available to Withdraw",v:fmt$(latest?.actualATW??availableToWithdraw),c:(latest?.actualATW??availableToWithdraw)>500?"#6EE7B7":(latest?.actualATW??availableToWithdraw)>0?"#FCD34D":"#FCA5A5"},
+              {l:"Available to Withdraw",v:latest?.actualATW!=null?fmt$(latest.actualATW):"Log actual",c:latest?.actualATW!=null?(latest.actualATW>500?"#6EE7B7":"#FCD34D"):"rgba(255,255,255,0.3)"},
             ].map(({l,v,c})=>(
               <div key={l}><div style={{fontSize:10,color:"rgba(255,255,255,0.4)",marginBottom:4}}>{l}</div><div style={{fontSize:15,fontWeight:700,color:c,fontFamily:"'Lora', serif"}}>{v}</div></div>
             ))}
@@ -2479,7 +2753,7 @@ function HelpPage({ settings }) {
           <Term term="Blended Yield (Holdings)" color={T.indigo}>Calculated from your actual positions: Total Est. Annual Income ÷ Total Market Value. More accurate than a flat 23% assumption as your portfolio grows and evolves.</Term>
           <Term term="Maintenance Requirement" color={T.red}>E-Trade's position-specific minimum equity requirement. Standard ETFs: 25%. High-yield options ETFs (XDTE, QDTE, WPAY): 50%. TQQQ (3× leveraged): 90%. Higher than Reg T's flat 25% for volatile holdings. Drives your true margin call threshold.</Term>
           <Term term="Weighted Maintenance Rate" color={T.red}>Your portfolio's blended maintenance requirement — the average of each position's requirement weighted by its market value. A 40% weighted rate means E-Trade requires you to maintain 40% equity on average across your holdings. This is your true margin call floor — not 25%.</Term>
-          <Term term="Available to Withdraw">max(0, Equity − Maintenance Requirement$). The amount E-Trade will let you move out of the account. Found in E-Trade → Balances. YieldStack calculates it from position-level maintenance requirements once holdings are uploaded.</Term>
+          <Term term="Available to Withdraw">The amount E-Trade will let you move out of the account — found in E-Trade → Accounts → Balances. Log this every month when saving a log entry. The Deploy tab uses it as a real-world cap on deployment limits. YieldStack does not estimate this; only the logged actual value is shown.</Term>
           <Term term="Holdings Snapshot">A full point-in-time capture of your portfolio — every position, market value, gain/loss, and yield. Stored separately from monthly logs. Upload as often as you like.</Term>
         </Card>
         <Card>
@@ -2806,7 +3080,7 @@ export default function App() {
   const linePath=computed.length>1?"M"+computed.map((e,i)=>`${toX(i)},${toY(e.equity)}`).join(" L"):null;
   const areaPath=linePath?linePath+` L${toX(computed.length-1)},${cPad.t+ciH} L${toX(0)},${cPad.t+ciH} Z`:null;
 
-  const TABS=[["dashboard","Overview"],["modeler","Bill Modeler"],["bills","Bill Tracker"],["holdings","Holdings"],["dividends","Dividends"],["stress","Stress Test"],["metrics","Metrics"],["log","History"],["settings","Settings"],["help","Help"]];
+  const TABS=[["dashboard","Overview"],["modeler","Bill Modeler"],["bills","Bill Tracker"],["holdings","Holdings"],["dividends","Dividends"],["deploy","Deploy"],["stress","Stress Test"],["metrics","Metrics"],["log","History"],["settings","Settings"],["help","Help"]];
 
   return(
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'Nunito', 'Helvetica Neue', Arial, sans-serif"}}>
@@ -2984,7 +3258,7 @@ export default function App() {
                       {l:"EQUITY",v:fmtPct(currentSnapshot.equity),c:eqColor(currentSnapshot.equity)},
                       {l:"DIVS / MO",v:fmt$(currentSnapshot.effectiveDivs),c:T.green,badge:currentSnapshot.fromHoldings?"HOLDINGS":"EST"},
                       {l:"COVERAGE",v:fmtPct(currentSnapshot.coverage,1),c:currentSnapshot.coverage>=1?T.green:T.amber},
-                      {l:"AVAIL. TO WITHDRAW",v:fmt$((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0),c:((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0)>500?T.green:((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0)>0?T.amber:T.red,badge:currentSnapshot.actualATW!=null?"ACTUAL":"ROUGH",sub:currentSnapshot.actualATW!=null&&currentSnapshot.availableToWithdraw>0?`Model: ${fmt$(currentSnapshot.availableToWithdraw)} (Δ ${fmt$(currentSnapshot.actualATW-currentSnapshot.availableToWithdraw)})`:"model estimate — may differ from E-Trade"},
+                      {l:"AVAIL. TO WITHDRAW",v:currentSnapshot.actualATW!=null?fmt$(currentSnapshot.actualATW):"— Log actual",c:currentSnapshot.actualATW!=null?(currentSnapshot.actualATW>500?T.green:T.amber):T.textMuted,badge:currentSnapshot.actualATW!=null?"ACTUAL":null,sub:currentSnapshot.actualATW!=null?"logged from E-Trade Balances":"E-Trade → Accounts → Balances → add when logging"},
                       {l:"NET DRAW",v:fmt$(currentSnapshot.trueNetDraw),c:currentSnapshot.trueNetDraw>0?T.red:T.green},
                     ].map(({l,v,c,badge})=><StatTile key={l} label={l} value={v} color={c} size={14} badge={badge} serif/>)}
                   </div>
@@ -3009,6 +3283,7 @@ export default function App() {
         {activeTab==="bills"&&<BillTrackerTab billItems={billItems} setBillItems={setBillItems} saveBills={saveBills} latest={currentSnapshot} settings={fullSettings}/>}
         {activeTab==="holdings"&&<HoldingsTab holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots} saveHoldings={saveHoldings} divLedger={divLedger} saveDivLedger={saveDivLedger} settings={fullSettings} saveSettings={setSettings}/>}
         {activeTab==="dividends"&&<DividendsTab computed={computed}/>}
+        {activeTab==="deploy"&&<DeployTab latest={currentSnapshot} settings={fullSettings}/>}
         {activeTab==="stress"&&<StressTestTab latest={currentSnapshot} settings={fullSettings} positions={latestHoldings?.positions||null}/>}
 
         {activeTab==="metrics"&&(
@@ -3087,7 +3362,7 @@ export default function App() {
                     rows:[
                       {l:"Freedom Date",v:freedomDate||"—",c:T.indigo},
                       {l:"Bills covered",v:fmtPct(currentSnapshot.coverage,1),c:currentSnapshot.coverage>=1?T.green:T.amber},
-                      {l:"Avail. to withdraw",v:fmt$((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0),c:((currentSnapshot.actualATW??currentSnapshot.availableToWithdraw)||0)>500?T.green:T.amber},
+                      {l:"Avail. to withdraw",v:currentSnapshot.actualATW!=null?fmt$(currentSnapshot.actualATW):"Log actual",c:currentSnapshot.actualATW!=null?(currentSnapshot.actualATW>500?T.green:T.amber):T.textMuted},
                     ]},
                 ].map(({title,main,mainColor,sub,rows})=>(
                   <Card key={title}>
@@ -3173,10 +3448,14 @@ export default function App() {
                 <Input label="ACTUAL DIVIDENDS RECEIVED ($)" hint="optional" value={form.actualDivs} onChange={e=>{setSaveError(null);setForm(f=>({...f,actualDivs:e.target.value}));}} placeholder="e.g. 77.34" accent/>
                 <Input label="ACTUAL MARGIN INTEREST ($)" hint="optional" value={form.actualInterest} onChange={e=>{setSaveError(null);setForm(f=>({...f,actualInterest:e.target.value}));}} placeholder="e.g. 15.25"/>
               </div>
-              <div style={{background:"#F0F9FF",border:"1px solid #BAE6FD",borderRadius:T.radiusXs,padding:"10px 13px"}}>
-                <div style={{fontSize:11,fontWeight:700,color:"#0369A1",marginBottom:4}}>AVAILABLE TO WITHDRAW — from E*Trade Balances <span style={{fontWeight:400,color:"#0284C7"}}>(optional but recommended)</span></div>
+              <div style={{background:"#F0F9FF",border:"2px solid #38BDF8",borderRadius:T.radiusXs,padding:"12px 14px"}}>
+                <div style={{fontSize:11,fontWeight:700,color:"#0369A1",marginBottom:6,display:"flex",alignItems:"center",gap:6}}>
+                  <span>💰</span>
+                  <span>AVAILABLE TO WITHDRAW — from E-Trade Balances</span>
+                  <span style={{fontWeight:500,color:"#0284C7",fontSize:10}}>(log this every month)</span>
+                </div>
                 <Input label="" hint="" value={form.actualATW} onChange={e=>{setSaveError(null);setForm(f=>({...f,actualATW:e.target.value}));}} placeholder="e.g. 1,243.00"/>
-                <div style={{fontSize:10,color:"#0284C7",marginTop:4}}>E*Trade → Accounts → Balances → Available to Withdraw. This anchors the model to reality and shows you the gap.</div>
+                <div style={{fontSize:10,color:"#0284C7",marginTop:5,lineHeight:1.6}}>E-Trade → Accounts → Balances → Available to Withdraw. This is the authoritative number — the Deploy tab uses it as a real-world sanity cap on your margin limits.</div>
               </div>
             </div>
             <div style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"12px 14px",marginBottom:20,fontSize:11,color:T.textMuted,lineHeight:1.7}}>
