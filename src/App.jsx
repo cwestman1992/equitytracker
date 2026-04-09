@@ -5,8 +5,9 @@ const SETTINGS_KEY  = "p2p-settings-v1";
 const BILLS_KEY     = "p2p-bills-v1";
 const HOLDINGS_KEY  = "p2p-holdings-v1";
 const DIVLEDGER_KEY = "p2p-divledger-v1";
+const MARGIN_KEY    = "p2p-margin-v1";
 
-const DEFAULT_SETTINGS = { marginRate: 0.0844, targetYield: 0.23, yieldMode: "manual", dripTickers: ["CLM", "CRF", "GOF", "ECAT", "SPYG"], defaultW2: 871 };
+const DEFAULT_SETTINGS = { marginRate: 0.0844, targetYield: 0.23, yieldMode: "manual", dripTickers: ["CLM", "CRF", "GOF", "ECAT", "SPYG"], defaultW2: 871, monthlyIncome: 10000 };
 
 const parseNum = (s) => { const n = parseFloat(String(s).replace(/,/g, "")); return isNaN(n) ? 0 : n; };
 const fmt$ = (v, dec = 2) => "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec });
@@ -175,6 +176,93 @@ function mergeDividendImport(existingLedger, parseResult) {
   }
   
   return { merged, added, skipped };
+}
+
+// ── MARGIN REPORT CSV PARSER ──────────────────────────────────────────────────
+// Parses E-Trade's margin download CSV. Contains three sections separated by blank lines:
+// 1. Account Summary — net value, ATW, marginable/non-marginable securities
+// 2. Margin Summary — maintenance excess, total equity, total requirement
+// 3. Margin Details — per-position maintenance % and $
+function parseMarginCSV(csvText) {
+  const lines = csvText.split(/\r?\n/).map(l => l.trim());
+  const result = {
+    availableToWithdraw: null,
+    maintenanceExcess: null,
+    totalMarginEquity: null,
+    totalMarginRequirement: null,
+    netAccountValue: null,
+    positions: [], // { ticker, value, maintenancePct, maintenanceReq$ }
+    uploadedAt: new Date().toISOString(),
+    errors: [],
+  };
+
+  let section = null;
+  let headerParsed = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) { headerParsed = false; continue; }
+
+    // Section detection
+    if (line.startsWith("Account Summary")) { section = "account"; headerParsed = false; continue; }
+    if (line.startsWith("MARGIN SUMMARY"))  { section = "summary"; headerParsed = false; continue; }
+    if (line.startsWith("MARGIN DETAILS"))  { section = "details"; headerParsed = false; continue; }
+    if (line.startsWith("SEARCH CRITERIA")) { section = "skip"; continue; }
+    if (section === "skip") continue;
+
+    const cols = line.split(",");
+
+    if (section === "account") {
+      if (!headerParsed) { headerParsed = true; continue; } // skip header row
+      // Account,Net Account Value,...,Available For Withdrawal,...
+      if (cols.length >= 7) {
+        result.netAccountValue = parseNum(cols[1]);
+        result.availableToWithdraw = parseNum(cols[6]);
+      }
+      section = null;
+    }
+
+    if (section === "summary") {
+      if (!headerParsed) { headerParsed = true; continue; }
+      // Maintenance Excess, Total Margin Equity, Total Margin Requirement
+      if (cols.length >= 3) {
+        result.maintenanceExcess    = parseNum(cols[0]);
+        result.totalMarginEquity    = parseNum(cols[1]);
+        result.totalMarginRequirement = parseNum(cols[2]);
+      }
+      section = null;
+    }
+
+    if (section === "details") {
+      if (!headerParsed) { headerParsed = true; continue; }
+      // Symbol,Quantity,Last Price $,Value $,Concentration %,Strategy,Maintenance Requirement %,Maintenance Requirement $
+      if (cols[0] === "TOTAL" || cols[0] === "") continue;
+      // Skip sub-rows (indented with leading space — already trimmed, but original had leading spaces)
+      const rawLine = lines[i];
+      const isSubRow = (csvText.split(/\r?\n/)[i] || "").startsWith(" ");
+      if (isSubRow) continue; // parent row handles the ticker; sub-rows would double count
+
+      const ticker = cols[0].trim().toUpperCase();
+      if (!ticker || ticker === "--") continue;
+
+      const valueStr  = cols[3]?.trim();
+      const pctStr    = cols[6]?.trim().replace("%","");
+      const reqStr    = cols[7]?.trim();
+      const value     = parseNum(valueStr);
+      const maintPct  = parseNum(pctStr) / 100;
+      const maintReq  = parseNum(reqStr);
+
+      if (ticker && value >= 0 && maintPct >= 0) {
+        result.positions.push({ ticker, value, maintenancePct: maintPct, maintenanceReqDollars: maintReq });
+      }
+    }
+  }
+
+  // Validate we got the critical numbers
+  if (result.availableToWithdraw === null) result.errors.push("Could not parse Available For Withdrawal");
+  if (result.maintenanceExcess === null)   result.errors.push("Could not parse Maintenance Excess");
+
+  return result;
 }
 
 const SUPABASE_KEY = "p2p-supabase-config-v1";
@@ -366,75 +454,46 @@ function movingAverage(values, window) {
 // Use the per-position override in Holdings tab if your actual requirement differs.
 const MAINTENANCE_MAP = {
   // ── B1 GROWTH ANCHORS ─────────────────────────────────────────────────────────
-  // Broad index ETFs — standard 25%
   SPY:   0.25, VOO:   0.25, QQQ:   0.25, SPYG:  0.25, VGT:  0.25,
   XAR:   0.25, AAAU:  0.25,
-  // Large-cap blue chip stocks — 30%
   AAPL:  0.30, MSFT:  0.30, AMZN:  0.30, GOOG:  0.30, GOOGL: 0.30,
   NVDA:  0.30, COST:  0.30, MCD:   0.30,
   "BRK.B": 0.30, BRKB: 0.30, BRKA: 0.30,
-  // Mid/small cap or more volatile — 35%
-  KGC:   0.35, PARR:  0.35, ARKK:  0.35,
-  // Highly volatile individual stocks — 50%
+  KGC:   0.35, PARR:  0.45, ARKK:  0.35,  // PARR: 45% verified E-Trade CSV Apr 2026
   MSTR:  0.50,
-  // Leveraged ETFs — dramatically higher (E-Trade standard policy)
-  TQQQ:  0.90,  // 3× Nasdaq-100 — E-Trade house requirement 90%
-  SQQQ:  0.90,  // 3× inverse
-  UPRO:  0.90,  // 3× S&P 500
-  SSO:   0.75,  // 2× S&P 500
-  QLD:   0.75,  // 2× QQQ
-  BITX:  0.75,  // 2× Bitcoin — leveraged crypto
+  TQQQ:  0.75,  // verified E-Trade CSV Apr 2026 (was 90%)
+  SQQQ:  0.90, UPRO:  0.90, SSO:   0.75, QLD:   0.75, BITX:  0.75,
 
   // ── B2 CEF COMPOUNDERS ────────────────────────────────────────────────────────
-  // Closed-End Funds — typically 30%
   CLM:   0.30, CRF:   0.30, GOF:   0.30, ECAT:  0.30,
   PTY:   0.30, PCI:   0.30, PDI:   0.30, RFI:   0.30,
   UTF:   0.30, UTG:   0.30,
-  QQQH:  0.30, XQQI:  0.30,
+  QQQH:  0.50, XQQI:  0.50,  // QQQH: 50% verified E-Trade CSV Apr 2026 (was 30%)
 
   // ── B3 HIGH-YIELD WORKHORSES ──────────────────────────────────────────────────
-  // Broad-index options income ETFs — 30-35%
-  SPYI:  0.30,  // S&P 500 covered calls — relatively stable index
-  QQQI:  0.35,  // QQQ options income
-  IWMY:  0.40,  // IWM weekly options — small cap, more volatile
+  SPYI:  0.30,  // verified E-Trade CSV Apr 2026
+  QQQI:  0.50,  // verified E-Trade CSV Apr 2026 (was 35%)
+  IWMY:  0.50,  // verified E-Trade CSV Apr 2026 (was 40%)
+  XDTE:  0.50, QDTE:  0.50,
+  RDTE:  0.35,  // verified E-Trade CSV Apr 2026 (was 50%)
+  WDTE:  0.50,
+  QQQY:  0.30,  // verified E-Trade CSV Apr 2026 (was 50%)
+  NVDY:  0.50,  // verified E-Trade CSV Apr 2026 (was 55%)
+  TSLY:  0.60, MSTY:  0.65, AMZY:  0.55, GOOGY: 0.55,
+  PLTY:  0.65, CONY:  0.55, APLY:  0.55, YMAG:  0.50,
+  BRKW:  1.00,  // verified E-Trade CSV Apr 2026 (was 50%)
+  HOOY:  0.50,  // verified E-Trade CSV Apr 2026
+  WPAY:  0.50, YMAX:  0.50, ULTY:  0.60,
+  USOY:  0.50,  // verified E-Trade CSV Apr 2026
+  BTCI:  0.65, TSII:  0.55,
+  TOPW:  0.50,  // verified E-Trade CSV Apr 2026
 
-  // 0DTE / weekly options strategy ETFs — 50%
-  // These hold cash + sell 0DTE options. E-Trade applies 50% house requirement.
-  XDTE:  0.50,  // S&P 500 0DTE
-  QDTE:  0.50,  // QQQ 0DTE
-  RDTE:  0.50,  // Russell 2000 0DTE
-  WDTE:  0.50,  // Weekly options strategy
-
-  // QQQ-focused options income — 50%
-  QQQY:  0.50,  // Defiance QQQ options income
-
-  // Single-stock options income ETFs — elevated due to single-stock volatility
-  NVDY:  0.55,  // NVDA options (NVDA extremely volatile)
-  TSLY:  0.60,  // TSLA options (TSLA extremely volatile)
-  MSTY:  0.65,  // MicroStrategy options (MSTR + crypto exposure — highest)
-  AMZY:  0.55,  // AMZN options
-  GOOGY: 0.55,  // GOOG options
-  PLTY:  0.65,  // PLTR options (highly speculative)
-  CONY:  0.55,  // COIN options (crypto-adjacent)
-  APLY:  0.55,  // AAPL options
-  YMAG:  0.50,  // YieldMax Mag7 basket
-
-  // Other high-yield / specialty
-  BRKW:  0.50,  // Weekly BRK options
-  HOOY:  0.50,  // High-yield options strategy
-  WPAY:  0.50,  // Weekly pay options
-  YMAX:  0.50,  // YieldMax universe ETF
-  ULTY:  0.60,  // Ultra-high income (complex, volatile)
-  USOY:  0.50,  // US Oil options income
-  BTCI:  0.65,  // Bitcoin options income (crypto exposure)
-  TSII:  0.55,  // Single-stock options income
-
-  // REITs — 30%
+  // REITs
   O:     0.30,
 
-  // Commodity-linked — 35%
-  IAUI:  0.35,  // Gold-related
-  KSLV:  0.35,  // Silver-related
+  // Commodity-linked (verified E-Trade CSV Apr 2026)
+  IAUI:  0.50,  // was 35%
+  KSLV:  0.50,  // was 35%
 };
 
 const DEFAULT_MAINTENANCE_REQ = 0.30; // Conservative fallback for unknown tickers
@@ -1899,6 +1958,362 @@ function DividendsTab({ computed }) {
   );
 }
 
+// ── ROUTING CENTER TAB ────────────────────────────────────────────────────────
+function RoutingCenterTab({ latest, settings, entries, computed, billItems, marginReport, saveMarginReport }) {
+  const [dragOver, setDragOver] = useState(false);
+  const [parseStatus, setParseStatus] = useState(null); // null | "success" | "error"
+  const fileRef = useRef(null);
+
+  const monthlyIncome = settings.monthlyIncome || 10000;
+  const deposit = settings.defaultW2 || 0;
+  const floatedBills = billItems.filter(b => b.isFloated).reduce((s, b) => s + b.amount, 0);
+  const totalRouted = deposit + floatedBills;
+  const pctDeposit = monthlyIncome > 0 ? deposit / monthlyIncome : 0;
+  const pctBills   = monthlyIncome > 0 ? floatedBills / monthlyIncome : 0;
+  const pctTotal   = pctDeposit + pctBills;
+  const stillInChecking = Math.max(0, monthlyIncome - totalRouted);
+
+  // P2P coverage ratio stage
+  const coverage = latest ? (latest.effectiveDivs || 0) / Math.max(1, latest.bills || floatedBills) : 0;
+  const coverageStage = coverage >= 1 ? { label: "Freedom", color: T.green, bg: T.greenBg, border: T.greenBorder }
+    : coverage >= 0.75 ? { label: "Strong Position", color: T.green, bg: T.greenBg, border: T.greenBorder }
+    : coverage >= 0.50 ? { label: "Comfortable to Add", color: T.green, bg: T.greenBg, border: T.greenBorder }
+    : coverage >= 0.25 ? { label: "Getting Established", color: T.amber, bg: T.amberBg, border: T.amberBorder }
+    : { label: "Early Stage — Building", color: T.blue, bg: T.blueBg, border: T.blueBorder };
+
+  // Routing capacity — how much more can safely flow through the brokerage?
+  // Uses maintenanceExcess from margin report if available, otherwise estimates from currentSnapshot.
+  // Binary searches: max additional monthly bill where 12-month projected min equity >= floor.
+  const calcMaxAdditionalBill = (floor) => {
+    if (!latest) return null;
+    let lo = 0, hi = monthlyIncome;
+    for (let i = 0; i < 60; i++) {
+      const mid = (lo + hi) / 2;
+      const minEq = projectMinEquity(latest.gross, latest.margin, latest.effectiveDivs, latest.w2, latest.bills + mid, settings.marginRate, settings.effectiveYield, 12);
+      if (minEq >= floor) lo = mid; else hi = mid;
+    }
+    return Math.max(0, Math.floor(lo / 5) * 5);
+  };
+
+  const maxConservative = calcMaxAdditionalBill(0.60);
+  const maxAggressive   = calcMaxAdditionalBill(0.55);
+
+  // Maintenance excess from margin report — ground truth headroom
+  const maintExcess = marginReport?.maintenanceExcess ?? null;
+  const maintTotal  = marginReport?.totalMarginRequirement ?? null;
+  const maintEquity = marginReport?.totalMarginEquity ?? null;
+
+  // Progress chart data from log entries
+  const chartData = useMemo(() => {
+    if (!entries.length) return [];
+    return entries.map(e => {
+      const inc = monthlyIncome || 1;
+      const dep = e.w2 || 0;
+      const bil = e.bills || 0;
+      const pDep = Math.min(1, dep / inc);
+      const pBil = Math.min(1, bil / inc);
+      const pTot = Math.min(1, (dep + bil) / inc);
+      return { date: e.date, pDeposit: pDep, pBills: pBil, pTotal: pTot, deposit: dep, bills: bil };
+    });
+  }, [entries, monthlyIncome]);
+
+  // Margin CSV upload handler
+  const handleMarginFile = async (file) => {
+    if (!file || !file.name.endsWith(".csv")) { setParseStatus("error"); return; }
+    try {
+      const text = await file.text();
+      const result = parseMarginCSV(text);
+      if (result.errors.length && !result.availableToWithdraw && !result.maintenanceExcess) {
+        setParseStatus("error"); return;
+      }
+      await saveMarginReport(result);
+      setParseStatus("success");
+      setTimeout(() => setParseStatus(null), 4000);
+    } catch { setParseStatus("error"); }
+  };
+
+  const onDrop = (e) => { e.preventDefault(); setDragOver(false); handleMarginFile(e.dataTransfer.files[0]); };
+
+  // SVG Progress Chart
+  const ProgressChart = () => {
+    if (!chartData.length) return null;
+    // Add current month as a "live" data point if not yet logged
+    const allPoints = [...chartData];
+    const W = 600, H = 200, pad = { t: 16, r: 24, b: 32, l: 44 };
+    const iW = W - pad.l - pad.r, iH = H - pad.t - pad.b;
+    const n = allPoints.length;
+    const toX = (i) => pad.l + (n === 1 ? iW / 2 : (i / (n - 1)) * iW);
+    const toY = (v) => pad.t + iH - Math.min(1, Math.max(0, v)) * iH;
+    const BAR_W = Math.max(8, Math.min(40, iW / (n + 1) * 0.6));
+
+    return (
+      <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ overflow: "visible" }}>
+        {/* Grid lines */}
+        {[0.25, 0.50, 0.75, 1.00].map(v => (
+          <g key={v}>
+            <line x1={pad.l} x2={pad.l + iW} y1={toY(v)} y2={toY(v)}
+              stroke={v === 1.00 ? T.green : T.borderLight} strokeWidth={v === 1.00 ? 1.5 : 1}
+              strokeDasharray={v === 1.00 ? "6,3" : "0"} opacity={0.7} />
+            <text x={pad.l - 6} y={toY(v) + 4} textAnchor="end" fill={v === 1.00 ? T.green : T.textMuted}
+              fontSize="9" fontFamily="Nunito" fontWeight={v === 1.00 ? "700" : "400"}>
+              {v === 1.00 ? "100%" : `${(v * 100).toFixed(0)}%`}
+            </text>
+          </g>
+        ))}
+        {/* Goal label */}
+        <text x={pad.l + iW + 4} y={toY(1.00) + 4} fill={T.green} fontSize="8" fontFamily="Nunito" fontWeight="700">GOAL</text>
+
+        {/* Stacked bars */}
+        {allPoints.map((pt, i) => {
+          const x = toX(i) - BAR_W / 2;
+          const depH = pt.pDeposit * iH;
+          const bilH = pt.pBills * iH;
+          const [mo, yr] = pt.date.split("-");
+          const label = `${["","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][parseInt(mo)]} '${yr?.slice(2)}`;
+          return (
+            <g key={pt.date}>
+              {/* Bills segment (bottom) */}
+              {bilH > 0 && (
+                <rect x={x} y={toY(pt.pBills)} width={BAR_W} height={bilH}
+                  fill={T.violet} opacity={0.85} rx={2} />
+              )}
+              {/* Deposit segment (stacked on top) */}
+              {depH > 0 && (
+                <rect x={x} y={toY(pt.pDeposit + pt.pBills)} width={BAR_W} height={depH}
+                  fill={T.green} opacity={0.85} rx={2} />
+              )}
+              {/* Total % label on top */}
+              <text x={toX(i)} y={toY(pt.pTotal) - 4} textAnchor="middle"
+                fill={T.textMuted} fontSize="8" fontFamily="Nunito" fontWeight="600">
+                {(pt.pTotal * 100).toFixed(0)}%
+              </text>
+              {/* X axis label */}
+              <text x={toX(i)} y={H - 4} textAnchor="middle"
+                fill={T.textMuted} fontSize="8" fontFamily="Nunito">{label}</text>
+            </g>
+          );
+        })}
+
+        {/* Legend */}
+        <rect x={pad.l} y={pad.t - 12} width={10} height={10} fill={T.green} opacity={0.85} rx={2} />
+        <text x={pad.l + 14} y={pad.t - 3} fill={T.textMuted} fontSize="9" fontFamily="Nunito">Deposit</text>
+        <rect x={pad.l + 64} y={pad.t - 12} width={10} height={10} fill={T.violet} opacity={0.85} rx={2} />
+        <text x={pad.l + 78} y={pad.t - 3} fill={T.textMuted} fontSize="9" fontFamily="Nunito">Bills floating</text>
+      </svg>
+    );
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+      {/* ── SECTION 1: YOUR ROUTING PICTURE ── */}
+      <Card>
+        <SectionLabel>YOUR ROUTING PICTURE — THIS MONTH</SectionLabel>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12, marginBottom: 16 }}>
+          {[
+            { l: "Monthly Income", v: fmt$(monthlyIncome, 0), c: T.text, sub: "set in Settings" },
+            { l: "Deposit / Mo", v: fmt$(deposit, 0), c: T.green, sub: `${fmtPct(pctDeposit, 0)} of income` },
+            { l: "Bills Floating", v: fmt$(floatedBills, 0), c: T.violet, sub: `${fmtPct(pctBills, 0)} of income` },
+            { l: "Still in Checking", v: fmt$(stillInChecking, 0), c: stillInChecking > 0 ? T.amber : T.green, sub: stillInChecking > 0 ? "not yet working for you" : "fully routed!" },
+          ].map(({ l, v, c, sub }) => (
+            <div key={l} style={{ background: T.surfaceAlt, borderRadius: T.radiusSm, padding: "14px 16px", border: `1px solid ${T.borderLight}` }}>
+              <div style={{ fontSize: 10, color: T.textMuted, fontWeight: 600, letterSpacing: "1px", marginBottom: 6 }}>{l}</div>
+              <div style={{ fontSize: 20, fontWeight: 700, color: c, fontFamily: "'Lora', serif" }}>{v}</div>
+              <div style={{ fontSize: 10, color: T.textMuted, marginTop: 4 }}>{sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Routing progress bar */}
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+            <span style={{ fontSize: 11, fontWeight: 600, color: T.textSub }}>
+              {fmtPct(pctTotal, 0)} of income routed through brokerage
+            </span>
+            <span style={{ fontSize: 11, color: T.textMuted }}>Goal: 100%</span>
+          </div>
+          <div style={{ height: 12, background: T.borderLight, borderRadius: 6, overflow: "hidden", display: "flex" }}>
+            <div style={{ width: `${Math.min(100, pctBills * 100)}%`, background: T.violet, transition: "width 0.5s" }} />
+            <div style={{ width: `${Math.min(100 - pctBills * 100, pctDeposit * 100)}%`, background: T.greenMid, transition: "width 0.5s" }} />
+          </div>
+          <div style={{ display: "flex", gap: 16, marginTop: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <div style={{ width: 8, height: 8, borderRadius: 2, background: T.greenMid }} />
+              <span style={{ fontSize: 10, color: T.textMuted }}>Deposit {fmtPct(pctDeposit, 0)}</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <div style={{ width: 8, height: 8, borderRadius: 2, background: T.violet }} />
+              <span style={{ fontSize: 10, color: T.textMuted }}>Bills floating {fmtPct(pctBills, 0)}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Coverage ratio stage */}
+        <div style={{ padding: "10px 14px", background: coverageStage.bg, border: `1px solid ${coverageStage.border}`, borderRadius: T.radiusXs, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: coverageStage.color, letterSpacing: "1px" }}>COVERAGE RATIO STAGE</div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: coverageStage.color, marginTop: 2 }}>{coverageStage.label}</div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 28, fontWeight: 700, color: coverageStage.color, fontFamily: "'Lora', serif" }}>{fmtPct(coverage, 1)}</div>
+            <div style={{ fontSize: 10, color: coverageStage.color, opacity: 0.8 }}>dividends ÷ bills</div>
+          </div>
+        </div>
+      </Card>
+
+      {/* ── SECTION 2: ROUTING CAPACITY ── */}
+      <Card>
+        <SectionLabel>ROUTING CAPACITY — HOW MUCH MORE CAN YOU SAFELY ADD?</SectionLabel>
+        <div style={{ fontSize: 12, color: T.textSub, marginBottom: 16, lineHeight: 1.7 }}>
+          Each dollar you add to the brokerage (via a new bill or larger deposit) uses margin capacity. Your blended maintenance requirement means $1 of margin draw costs more than $1 of equity. These limits account for that — they project 12 months forward and find the maximum additional monthly routing that keeps equity above each floor.
+        </div>
+
+        {/* Margin report key numbers */}
+        {marginReport && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 16 }}>
+            {[
+              { l: "MAINTENANCE EXCESS", v: fmt$(maintExcess ?? 0), c: (maintExcess ?? 0) > 2000 ? T.green : (maintExcess ?? 0) > 500 ? T.amber : T.red, sub: "E-Trade's headroom above floor" },
+              { l: "TOTAL MAINT. REQ.", v: fmt$(maintTotal ?? 0), c: T.text, sub: "committed to maintain positions" },
+              { l: "TOTAL MARGIN EQUITY", v: fmt$(maintEquity ?? 0), c: T.text, sub: "from E-Trade margin report" },
+            ].map(({ l, v, c, sub }) => (
+              <div key={l} style={{ background: T.surfaceAlt, borderRadius: T.radiusSm, padding: "12px 14px", border: `1px solid ${T.borderLight}` }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: T.textMuted, letterSpacing: "1px", marginBottom: 4 }}>{l}</div>
+                <div style={{ fontSize: 17, fontWeight: 700, color: c, fontFamily: "'Lora', serif" }}>{v}</div>
+                <div style={{ fontSize: 10, color: T.textMuted, marginTop: 3 }}>{sub}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+          <div style={{ background: T.greenBg, border: `1px solid ${T.greenBorder}`, borderRadius: T.radius, padding: "18px 24px" }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "1.5px", color: T.green, marginBottom: 4 }}>CONSERVATIVE — STAYS ABOVE 60% FOR 12 MO</div>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+              <div style={{ fontSize: 36, fontWeight: 700, color: T.green, fontFamily: "'Lora', serif" }}>
+                {maxConservative !== null ? fmt$(maxConservative, 0) : "—"}
+              </div>
+              {maxConservative !== null && maxConservative > 0 && <div style={{ fontSize: 13, color: T.textMuted }}>/mo more</div>}
+            </div>
+            <div style={{ fontSize: 11, color: T.textSub, marginTop: 4 }}>
+              {maxConservative !== null && maxConservative > 0
+                ? "Add this as a new bill — equity stays above the 60% trigger all year"
+                : "No headroom above 60% — focus on growing dividends first"}
+            </div>
+          </div>
+          <div style={{ background: T.amberBg, border: `1px solid ${T.amberBorder}`, borderRadius: T.radius, padding: "18px 24px" }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "1.5px", color: T.amber, marginBottom: 4 }}>AGGRESSIVE — STAYS ABOVE 55% FOR 12 MO</div>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+              <div style={{ fontSize: 36, fontWeight: 700, color: T.amber, fontFamily: "'Lora', serif" }}>
+                {maxAggressive !== null ? fmt$(maxAggressive, 0) : "—"}
+              </div>
+              {maxAggressive !== null && maxAggressive > 0 && <div style={{ fontSize: 13, color: T.textMuted }}>/mo more</div>}
+            </div>
+            <div style={{ fontSize: 11, color: T.textSub, marginTop: 4 }}>
+              {maxAggressive !== null && maxAggressive > 0
+                ? "Max before hitting the 55% hard floor — you lose bill-add eligibility in this range"
+                : "No margin headroom — equity at or near the hard floor"}
+            </div>
+          </div>
+        </div>
+
+        {!latest && (
+          <div style={{ marginTop: 12, padding: "10px 14px", background: T.amberBg, border: `1px solid ${T.amberBorder}`, borderRadius: T.radiusXs, fontSize: 11, color: T.amber }}>
+            Log a month or upload a holdings snapshot to see routing capacity limits.
+          </div>
+        )}
+
+        {marginReport?.availableToWithdraw != null && (
+          <div style={{ marginTop: 12, padding: "10px 14px", background: T.greenBg, border: `1px solid ${T.greenBorder}`, borderRadius: T.radiusXs, fontSize: 11, color: T.green, lineHeight: 1.6 }}>
+            <strong>E-Trade Available to Withdraw: {fmt$(marginReport.availableToWithdraw)}</strong> — from your uploaded margin report. This is the real-world cap on what E-Trade will allow you to route out or deploy.
+          </div>
+        )}
+      </Card>
+
+      {/* ── SECTION 3: PROGRESS CHART ── */}
+      <Card>
+        <SectionLabel>% OF INCOME ROUTED INTO THE SYSTEM — MONTH OVER MONTH</SectionLabel>
+        {chartData.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "32px 0", color: T.textMuted }}>
+            <div style={{ fontSize: 28, marginBottom: 8 }}>📊</div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: T.textSub }}>No log entries yet</div>
+            <div style={{ fontSize: 11, marginTop: 4 }}>Log your first month to start tracking routing progress.</div>
+          </div>
+        ) : (
+          <div>
+            <div style={{ fontSize: 11, color: T.textSub, marginBottom: 12, lineHeight: 1.6 }}>
+              Each bar shows the % of your monthly income (currently set to {fmt$(monthlyIncome, 0)}) routed through the brokerage — split between direct deposit (green) and bills floating via margin (purple). The goal is 100%.
+            </div>
+            <ProgressChart />
+          </div>
+        )}
+      </Card>
+
+      {/* ── SECTION 4: MARGIN REPORT UPLOAD ── */}
+      <Card>
+        <SectionLabel>E-TRADE MARGIN REPORT</SectionLabel>
+        <div style={{ fontSize: 12, color: T.textSub, marginBottom: 16, lineHeight: 1.7 }}>
+          Upload E-Trade's margin CSV to get exact Available to Withdraw, Maintenance Excess, and per-position maintenance requirements. Updates the Routing Capacity above and improves Stress Test accuracy. E-Trade → Accounts → Balances → Margin → Download.
+        </div>
+
+        {/* Drop zone */}
+        <div
+          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={onDrop}
+          onClick={() => fileRef.current?.click()}
+          style={{ border: `2px dashed ${dragOver ? T.blueMid : T.border}`, borderRadius: T.radiusSm, padding: "28px 24px", textAlign: "center", cursor: "pointer", background: dragOver ? T.blueBg : T.surfaceAlt, transition: "all 0.18s" }}
+        >
+          <input ref={fileRef} type="file" accept=".csv" style={{ display: "none" }} onChange={e => handleMarginFile(e.target.files[0])} />
+          <div style={{ fontSize: 28, marginBottom: 8 }}>📋</div>
+          {parseStatus === "success" ? (
+            <div style={{ fontSize: 13, fontWeight: 700, color: T.green }}>✓ Margin report loaded successfully</div>
+          ) : parseStatus === "error" ? (
+            <div style={{ fontSize: 13, fontWeight: 700, color: T.red }}>⚠ Could not parse file — make sure it's the E-Trade margin CSV</div>
+          ) : (
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: T.textSub }}>Drop margin CSV here or click to upload</div>
+              <div style={{ fontSize: 11, color: T.textMuted, marginTop: 4 }}>E-Trade margin download CSV · updates ATW and Maintenance Excess</div>
+            </div>
+          )}
+        </div>
+
+        {/* Last upload summary */}
+        {marginReport && (
+          <div style={{ marginTop: 16, background: T.surfaceAlt, borderRadius: T.radiusSm, padding: "14px 16px", border: `1px solid ${T.borderLight}` }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: T.indigo }}>📋 LAST MARGIN REPORT</div>
+              <div style={{ fontSize: 10, color: T.textMuted }}>{new Date(marginReport.uploadedAt).toLocaleString()}</div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10 }}>
+              {[
+                { l: "Avail. to Withdraw", v: marginReport.availableToWithdraw != null ? fmt$(marginReport.availableToWithdraw) : "—", c: T.green },
+                { l: "Maint. Excess", v: marginReport.maintenanceExcess != null ? fmt$(marginReport.maintenanceExcess) : "—", c: (marginReport.maintenanceExcess ?? 0) > 2000 ? T.green : T.amber },
+                { l: "Total Maint. Req.", v: marginReport.totalMarginRequirement != null ? fmt$(marginReport.totalMarginRequirement) : "—", c: T.text },
+                { l: "Positions", v: String(marginReport.positions?.length ?? 0), c: T.text },
+              ].map(({ l, v, c }) => (
+                <div key={l} style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 9, color: T.textMuted, fontWeight: 600, letterSpacing: "1px", marginBottom: 3 }}>{l}</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: c }}>{v}</div>
+                </div>
+              ))}
+            </div>
+            {marginReport.positions?.length > 0 && (
+              <div style={{ marginTop: 10, fontSize: 10, color: T.textMuted, lineHeight: 1.6 }}>
+                Per-position maintenance rates from this report are silently applied in the Stress Test for more accurate margin call modeling.
+              </div>
+            )}
+          </div>
+        )}
+      </Card>
+
+      {/* Caveat */}
+      <div style={{ padding: "10px 14px", background: T.amberBg, border: `1px solid ${T.amberBorder}`, borderRadius: T.radiusSm, fontSize: 11, color: T.amber, lineHeight: 1.7 }}>
+        <strong>⚠ Note:</strong> Routing capacity projections assume stable NAV and pre-tax dividends. The closer you operate to 60–65% equity, the faster the system compounds — but the less margin for error on volatility. Upload the margin report frequently to keep these numbers calibrated to E-Trade's actual data.
+      </div>
+    </div>
+  );
+}
+
 // ── CAPITAL DEPLOYMENT OPTIMIZER ──────────────────────────────────────────────
 function DeployTab({ latest, settings }) {
   const COLORS = [T.greenMid, T.blueMid, T.violet];
@@ -2549,7 +2964,7 @@ function StressTestTab({ latest, settings, positions }) {
 
 // ── SETTINGS TAB ──────────────────────────────────────────────────────────────
 function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdingsYield, hasHoldings, onExport, onImport, importStatus }) {
-  const [local, setLocal] = useState({ ...settings, marginRateStr: (settings.marginRate*100).toFixed(2), targetYieldStr: (settings.targetYield*100).toFixed(1), defaultW2Str: String(settings.defaultW2 ?? 871) });
+  const [local, setLocal] = useState({ ...settings, marginRateStr: (settings.marginRate*100).toFixed(2), targetYieldStr: (settings.targetYield*100).toFixed(1), defaultW2Str: String(settings.defaultW2 ?? 871), monthlyIncomeStr: String(settings.monthlyIncome ?? 10000) });
   const [sbUrl, setSbUrl] = useState(() => store.getSupabaseConfig()?.url || "");
   const [sbKey, setSbKey] = useState(() => store.getSupabaseConfig()?.anonKey || "");
   const [sbStatus, setSbStatus] = useState(store.getSupabaseConfig() ? "connected" : null);
@@ -2560,10 +2975,12 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
     const mr=parseNum(local.marginRateStr)/100;
     const ty=parseNum(local.targetYieldStr)/100;
     const dw2=parseNum(local.defaultW2Str);
+    const mi=parseNum(local.monthlyIncomeStr);
     if(mr<=0||mr>=1){setSaveMsg({ok:false,text:"Margin rate must be between 0% and 100%."});return;}
     if(ty<=0||ty>=2){setSaveMsg({ok:false,text:"Yield must be between 0% and 200%."});return;}
     if(dw2<=0){setSaveMsg({ok:false,text:"Monthly deposit must be greater than $0."});return;}
-    setSettings(s=>({...s,marginRate:mr,targetYield:ty,yieldMode:local.yieldMode,defaultW2:dw2}));
+    if(mi<=0){setSaveMsg({ok:false,text:"Monthly income must be greater than $0."});return;}
+    setSettings(s=>({...s,marginRate:mr,targetYield:ty,yieldMode:local.yieldMode,defaultW2:dw2,monthlyIncome:mi}));
     setSaveMsg({ok:true,text:"Settings saved."});
     setTimeout(()=>setSaveMsg(null),3000);
   };
@@ -2605,6 +3022,10 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
           <div style={{flex:1,minWidth:200}}>
             <Input label="Monthly deposit (used in all projections)" hint="($)" value={local.defaultW2Str} onChange={e=>setLocal(l=>({...l,defaultW2Str:e.target.value}))} placeholder="e.g. 871"/>
             <div style={{marginTop:8,fontSize:11,color:T.textMuted,lineHeight:1.6}}>Used by Freedom Date, Bill Modeler, and Conditions Checker. Set this to your actual recurring monthly transfer. Overrides the last log entry so projections stay accurate even when logs are stale.</div>
+            <div style={{marginTop:16}}>
+              <Input label="Total monthly take-home income" hint="($)" value={local.monthlyIncomeStr} onChange={e=>setLocal(l=>({...l,monthlyIncomeStr:e.target.value}))} placeholder="e.g. 10000"/>
+              <div style={{marginTop:8,fontSize:11,color:T.textMuted,lineHeight:1.6}}>Used by the Routing Center to show what % of your income is currently flowing through the brokerage. Set to your net monthly take-home after taxes.</div>
+            </div>
           </div>
           <div style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"14px 18px",minWidth:160,textAlign:"center"}}>
             <div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:6}}>CURRENT SETTING</div>
@@ -2656,7 +3077,7 @@ function SettingsTab({ settings, setSettings, derivedYield, hasActualData, holdi
       </Card>
       <div style={{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
         <button onClick={apply} style={{padding:"11px 28px",background:T.text,color:"#fff",border:"none",borderRadius:T.radiusXs,fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>Save Settings</button>
-        <button onClick={()=>{if(!window.confirm("Reset all settings to defaults? This will clear your margin rate and yield settings."))return;setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0",defaultW2Str:"871"});setSettings(DEFAULT_SETTINGS);setSaveMsg({ok:true,text:"Reset to defaults."});setTimeout(()=>setSaveMsg(null),3000);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
+        <button onClick={()=>{if(!window.confirm("Reset all settings to defaults? This will clear your margin rate and yield settings."))return;setLocal({...DEFAULT_SETTINGS,marginRateStr:"8.44",targetYieldStr:"23.0",defaultW2Str:"871",monthlyIncomeStr:"10000"});setSettings(DEFAULT_SETTINGS);setSaveMsg({ok:true,text:"Reset to defaults."});setTimeout(()=>setSaveMsg(null),3000);}} style={{padding:"11px 20px",background:"transparent",color:T.textSub,border:`1px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,cursor:"pointer",fontFamily:"inherit"}}>Reset to Defaults</button>
         {saveMsg&&<span style={{fontSize:12,fontWeight:600,color:saveMsg.ok?T.green:T.red}}>{saveMsg.ok?"✓":""} {saveMsg.text}</span>}
       </div>
 
@@ -2803,6 +3224,7 @@ export default function App() {
   const [billItems, setBillItems] = useState([]);
   const [holdingSnapshots, setHoldingSnapshots] = useState([]);
   const [divLedger, setDivLedger] = useState({});
+  const [marginReport, setMarginReport] = useState(null);
   const [form, setForm] = useState({ gross:"", margin:"", w2:"", bills:"", actualDivs:"", actualInterest:"", actualATW:"", date:new Date().toISOString().slice(0,7) });
   const [nextBill, setNextBill] = useState("200");
   const [showAdd, setShowAdd] = useState(false);
@@ -2823,6 +3245,7 @@ export default function App() {
       try { const v=await store.get(BILLS_KEY); if(v)setBillItems(JSON.parse(v)); } catch {}
       try { const v=await store.get(HOLDINGS_KEY); if(v)setHoldingSnapshots(JSON.parse(v)); } catch {}
       try { const v=await store.get(DIVLEDGER_KEY); if(v)setDivLedger(JSON.parse(v)); } catch {}
+      try { const v=await store.get(MARGIN_KEY); if(v)setMarginReport(JSON.parse(v)); } catch {}
     };
     load();
   }, []);
@@ -2833,6 +3256,7 @@ export default function App() {
   const saveBills = useCallback(async (data) => { try { await store.set(BILLS_KEY, JSON.stringify(data)); } catch {} }, []);
   const saveHoldings = useCallback(async (data) => { try { await store.set(HOLDINGS_KEY, JSON.stringify(data)); } catch {} }, []);
   const saveDivLedger = useCallback(async (data) => { setDivLedger(data); try { await store.set(DIVLEDGER_KEY, JSON.stringify(data)); } catch {} }, []);
+  const saveMarginReport = useCallback(async (data) => { setMarginReport(data); try { await store.set(MARGIN_KEY, JSON.stringify(data)); } catch {} }, []);
 
   const handleExport = useCallback(() => {
     exportAllData(entries, settings, billItems, holdingSnapshots, divLedger);
@@ -2940,8 +3364,7 @@ export default function App() {
         trueNetDraw,
         availableToWithdraw: calcAvailableToWithdraw(g, m, latestHoldings.positions),
         weightedMaintRate: calcWeightedMaintenanceRate(latestHoldings.positions),
-        actualATW: latest?.actualATW ?? null,
-        date: latest?.date || new Date().toISOString().slice(0, 7),
+        actualATW: marginReport?.availableToWithdraw ?? latest?.actualATW ?? null,
         equityMomentum: latest?.equityMomentum || null,
         actualYield: latestHoldings.totalEstAnnIncome && g > 0
           ? latestHoldings.totalEstAnnIncome / g : effectiveYield,
@@ -2961,9 +3384,8 @@ export default function App() {
       fromHoldings: false, marginIsEstimated: false,
       availableToWithdraw: calcAvailableToWithdraw(latest.gross, latest.margin, null),
       weightedMaintRate: DEFAULT_MAINTENANCE_REQ,
-      actualATW: latest?.actualATW ?? null,
-    } : null;
-  }, [latest, latestHoldings, effectiveYield, settings.marginRate, settings.defaultW2, billItems]);
+      actualATW: marginReport?.availableToWithdraw ?? latest?.actualATW ?? null,
+  }, [latest, latestHoldings, effectiveYield, settings.marginRate, settings.defaultW2, billItems, marginReport]);
   const nextBillAmt=parseNum(nextBill)||200;
   let risingStreak=0; for(let i=computed.length-1;i>=1;i--){if(computed[i].rising)risingStreak++;else break;}
   // Conditions: cond1 uses currentSnapshot equity (most current), cond2 uses log streak, cond3 uses currentSnapshot for projections
@@ -3080,7 +3502,7 @@ export default function App() {
   const linePath=computed.length>1?"M"+computed.map((e,i)=>`${toX(i)},${toY(e.equity)}`).join(" L"):null;
   const areaPath=linePath?linePath+` L${toX(computed.length-1)},${cPad.t+ciH} L${toX(0)},${cPad.t+ciH} Z`:null;
 
-  const TABS=[["dashboard","Overview"],["modeler","Bill Modeler"],["bills","Bill Tracker"],["holdings","Holdings"],["dividends","Dividends"],["deploy","Deploy"],["stress","Stress Test"],["metrics","Metrics"],["log","History"],["settings","Settings"],["help","Help"]];
+  const TABS=[["dashboard","Overview"],["routing","Routing Center"],["modeler","Bill Modeler"],["bills","Bill Tracker"],["holdings","Holdings"],["dividends","Dividends"],["deploy","Deploy"],["stress","Stress Test"],["metrics","Metrics"],["log","History"],["settings","Settings"],["help","Help"]];
 
   return(
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'Nunito', 'Helvetica Neue', Arial, sans-serif"}}>
@@ -3283,6 +3705,7 @@ export default function App() {
         {activeTab==="bills"&&<BillTrackerTab billItems={billItems} setBillItems={setBillItems} saveBills={saveBills} latest={currentSnapshot} settings={fullSettings}/>}
         {activeTab==="holdings"&&<HoldingsTab holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots} saveHoldings={saveHoldings} divLedger={divLedger} saveDivLedger={saveDivLedger} settings={fullSettings} saveSettings={setSettings}/>}
         {activeTab==="dividends"&&<DividendsTab computed={computed}/>}
+        {activeTab==="routing"&&<RoutingCenterTab latest={currentSnapshot} settings={fullSettings} entries={entries} computed={computed} billItems={billItems} marginReport={marginReport} saveMarginReport={saveMarginReport}/>}
         {activeTab==="deploy"&&<DeployTab latest={currentSnapshot} settings={fullSettings}/>}
         {activeTab==="stress"&&<StressTestTab latest={currentSnapshot} settings={fullSettings} positions={latestHoldings?.positions||null}/>}
 
