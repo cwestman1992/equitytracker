@@ -1967,11 +1967,77 @@ function DividendsTab({ computed }) {
   );
 }
 
+// ── ROUTING ADVISOR API ───────────────────────────────────────────────────────
+async function askRoutingAdvisor(question, portfolioContext) {
+  const systemPrompt = `You are YieldStack AI, a focused financial advisor embedded in a dividend income tracker built on the Paycheck to Portfolio (P2P) system by Shawn Grady.
+
+THE P2P SYSTEM:
+- The user deposits their paycheck directly into a brokerage margin account — 100% invested
+- Living expenses are paid via margin (borrowed against the portfolio)
+- Dividends grow over time and eventually cover the margin draw — achieving financial freedom
+- Three equity floors: 60% = trigger to add new bills, 55% = hard floor (never breach), 50% = Shawn's absolute minimum
+- Blended yield spread (yield - margin rate) is the engine — every dollar deployed earns more than it costs to borrow
+- Goal: maximize the % of income routed through the brokerage, as fast as safely possible
+
+WHAT YOU HELP WITH:
+- Optimal deposit amounts vs bill addition timing
+- When to add the next bill and how large
+- How to accelerate the dividend snowball without breaching equity floors
+- Trade-offs between aggressive and conservative routing strategies
+- Reading the current portfolio state and giving actionable guidance
+
+HOW TO RESPOND:
+- Be specific with numbers from the portfolio data provided
+- Show your reasoning (e.g. "at $1,000/mo deposit your equity projects to X% in month 6, which means...")
+- Give a clear recommendation with a primary action and secondary option
+- Keep it focused — answer the question asked, don't write an essay
+- Use plain language, not financial jargon
+- Always note the key constraint or risk in the recommended path
+- Format with short paragraphs, not bullet lists`;
+
+  const userMessage = `Here is my current portfolio state:
+
+${portfolioContext}
+
+My question: ${question}`;
+
+  const response = await fetch("/api/claude-proxy", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userMessage }]
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(`API error ${response.status}: ${err?.error || "unknown"}`);
+  }
+
+  const data = await response.json();
+  if (data.error) throw new Error(`API: ${data.error}`);
+  if (data.type === "error") throw new Error(`API: ${data.error?.message || data.type}`);
+
+  const text = (data.content || []).map(b => b.text || "").join("").trim();
+  if (!text) throw new Error("Empty response — try again");
+  return text;
+}
+
 // ── ROUTING CENTER TAB ────────────────────────────────────────────────────────
 function RoutingCenterTab({ latest, settings, entries, computed, billItems, marginReport, saveMarginReport }) {
   const [dragOver, setDragOver] = useState(false);
   const [parseStatus, setParseStatus] = useState(null); // null | "success" | "error"
   const fileRef = useRef(null);
+
+  // AI Advisor state
+  const [aiQuestion, setAiQuestion] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiResponse, setAiResponse] = useState(null);
+  const [aiError, setAiError] = useState(null);
+  const aiInputRef = useRef(null);
 
   const monthlyIncome = settings.monthlyIncome || 10000;
   const deposit = settings.defaultW2 || 0;
@@ -2027,6 +2093,76 @@ function RoutingCenterTab({ latest, settings, entries, computed, billItems, marg
   }, [entries, monthlyIncome]);
 
   // Margin CSV upload handler
+  // Build a plain-English portfolio context string for the AI
+  const buildPortfolioContext = () => {
+    const lines = [];
+    lines.push(`PORTFOLIO STATE:`);
+    if (latest) {
+      lines.push(`- Gross portfolio value: ${fmt$(latest.gross)}`);
+      lines.push(`- Margin debt: ${fmt$(latest.margin)}`);
+      lines.push(`- Equity: ${fmtPct(latest.equity)} (${latest.equity >= 0.60 ? "above 60% trigger" : latest.equity >= 0.55 ? "between 55-60% caution zone" : "BELOW 55% hard floor"})`);
+      lines.push(`- Monthly dividends: ${fmt$(latest.effectiveDivs)} (annualized: ${fmt$(latest.effectiveDivs * 12)})`);
+      lines.push(`- Bills floating via margin: ${fmt$(latest.bills)}/mo`);
+      lines.push(`- Coverage ratio: ${fmtPct(latest.coverage, 1)} (dividends ÷ bills)`);
+      lines.push(`- True net margin draw: ${fmt$(latest.trueNetDraw)}/mo (bills + interest - dividends)`);
+    }
+    lines.push(`\nSETTINGS:`);
+    lines.push(`- Monthly deposit (paycheck into brokerage): ${fmt$(settings.defaultW2 || 0)}/mo`);
+    lines.push(`- Monthly take-home income: ${fmt$(settings.monthlyIncome || 0)}/mo`);
+    lines.push(`- Effective blended yield: ${fmtPct(settings.effectiveYield, 1)}`);
+    lines.push(`- Margin interest rate: ${fmtPct(settings.marginRate, 2)}`);
+    lines.push(`- Yield spread (yield - margin rate): ${fmtPct(Math.max(0, settings.effectiveYield - settings.marginRate), 1)}`);
+    if (marginReport) {
+      lines.push(`\nMARGIN REPORT (from E-Trade, uploaded ${new Date(marginReport.uploadedAt).toLocaleDateString()}):`);
+      lines.push(`- Available to Withdraw: ${fmt$(marginReport.availableToWithdraw ?? 0)}`);
+      lines.push(`- Maintenance Excess: ${fmt$(marginReport.maintenanceExcess ?? 0)}`);
+      lines.push(`- Total Maintenance Requirement: ${fmt$(marginReport.totalMarginRequirement ?? 0)}`);
+    }
+    if (entries.length >= 2) {
+      const recent = computed.slice(-3);
+      lines.push(`\nRECENT TREND (last ${recent.length} logged months):`);
+      recent.forEach(e => {
+        lines.push(`- ${e.date}: equity ${fmtPct(e.equity)}, divs ${fmt$(e.effectiveDivs)}/mo${e.rising !== null ? (e.rising ? " ↑" : " ↓") : ""}`);
+      });
+    }
+    const floatedBills = billItems.filter(b => b.isFloated);
+    if (floatedBills.length) {
+      lines.push(`\nBILLS CURRENTLY FLOATING (${floatedBills.length} bills, ${fmt$(floatedBills.reduce((s,b)=>s+b.amount,0))}/mo total):`);
+      floatedBills.forEach(b => lines.push(`- ${b.name}: ${fmt$(b.amount)}/mo`));
+    }
+    const notFloated = billItems.filter(b => !b.isFloated);
+    if (notFloated.length) {
+      lines.push(`\nBILLS NOT YET ADDED TO SYSTEM (${notFloated.length} bills, ${fmt$(notFloated.reduce((s,b)=>s+b.amount,0))}/mo total):`);
+      notFloated.forEach(b => lines.push(`- ${b.name}: ${fmt$(b.amount)}/mo`));
+    }
+    return lines.join("\n");
+  };
+
+  const handleAskAdvisor = async (question) => {
+    const q = (question || aiQuestion).trim();
+    if (!q) return;
+    setAiLoading(true);
+    setAiResponse(null);
+    setAiError(null);
+    try {
+      const context = buildPortfolioContext();
+      const response = await askRoutingAdvisor(q, context);
+      setAiResponse({ question: q, answer: response, timestamp: new Date().toLocaleTimeString() });
+    } catch (err) {
+      setAiError(err.message || "Something went wrong — try again");
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  const SUGGESTED_QUESTIONS = [
+    "What's my optimal monthly deposit amount right now?",
+    "When can I safely add my next bill, and how large should it be?",
+    "What's the fastest path to 50% coverage without breaching 55% equity?",
+    "Am I deploying aggressively enough given my current yield spread?",
+    "What would happen if I increased my deposit by $200/mo starting now?",
+  ];
+
   const handleMarginFile = async (file) => {
     if (!file || !file.name.endsWith(".csv")) { setParseStatus("error"); return; }
     try {
@@ -2311,6 +2447,89 @@ function RoutingCenterTab({ latest, settings, entries, computed, billItems, marg
                 Per-position maintenance rates from this report are silently applied in the Stress Test for more accurate margin call modeling.
               </div>
             )}
+          </div>
+        )}
+      </Card>
+
+      {/* ── SECTION 5: AI ADVISOR ── */}
+      <Card>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:4}}>
+          <SectionLabel>YIELDSTACK AI ADVISOR</SectionLabel>
+          <span style={{fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:20,background:T.indigoBg,color:T.indigo,border:`1px solid ${T.indigoBorder}`,letterSpacing:"0.5px"}}>BETA</span>
+        </div>
+        <div style={{fontSize:12,color:T.textSub,marginBottom:16,lineHeight:1.7}}>
+          Ask a focused question about your routing strategy. The advisor has full access to your current portfolio state, margin report, bills, and trend data — and understands the P2P system mechanics.
+        </div>
+
+        {/* Suggested questions */}
+        <div style={{marginBottom:14}}>
+          <div style={{fontSize:10,fontWeight:700,color:T.textMuted,letterSpacing:"1px",marginBottom:8}}>SUGGESTED QUESTIONS</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+            {SUGGESTED_QUESTIONS.map(q=>(
+              <button key={q} onClick={()=>{setAiQuestion(q);setAiResponse(null);setAiError(null);setTimeout(()=>aiInputRef.current?.focus(),50);}}
+                style={{padding:"6px 12px",background:aiQuestion===q?T.indigoBg:T.surfaceAlt,color:aiQuestion===q?T.indigo:T.textSub,border:`1px solid ${aiQuestion===q?T.indigoBorder:T.border}`,borderRadius:20,fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit",transition:"all 0.15s",textAlign:"left",lineHeight:1.4}}>
+                {q}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Free-form input */}
+        <div style={{display:"flex",gap:10,alignItems:"flex-end",marginBottom:16}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:10,fontWeight:700,color:T.textMuted,letterSpacing:"1px",marginBottom:6}}>YOUR QUESTION</div>
+            <textarea
+              ref={aiInputRef}
+              value={aiQuestion}
+              onChange={e=>{setAiQuestion(e.target.value);setAiResponse(null);setAiError(null);}}
+              onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey&&aiQuestion.trim()){e.preventDefault();handleAskAdvisor();}}}
+              placeholder="Ask about deposit amounts, bill timing, spread efficiency, or routing strategy..."
+              rows={2}
+              style={{width:"100%",padding:"10px 13px",background:T.surfaceAlt,border:`1.5px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:13,color:T.text,fontFamily:"inherit",outline:"none",resize:"vertical",lineHeight:1.5,boxSizing:"border-box"}}
+              onFocus={e=>e.target.style.borderColor=T.blueMid}
+              onBlur={e=>e.target.style.borderColor=T.border}
+            />
+            <div style={{fontSize:10,color:T.textMuted,marginTop:4}}>Press Enter to ask · Shift+Enter for new line</div>
+          </div>
+          <button
+            onClick={()=>handleAskAdvisor()}
+            disabled={aiLoading||!aiQuestion.trim()}
+            style={{padding:"10px 20px",background:aiLoading||!aiQuestion.trim()?T.surfaceAlt:T.indigo,color:aiLoading||!aiQuestion.trim()?T.textMuted:"#fff",border:"none",borderRadius:T.radiusXs,fontSize:13,fontWeight:700,fontFamily:"inherit",cursor:aiLoading||!aiQuestion.trim()?"default":"pointer",whiteSpace:"nowrap",transition:"all 0.18s",height:44}}>
+            {aiLoading?"Thinking…":"Ask AI →"}
+          </button>
+        </div>
+
+        {/* Loading */}
+        {aiLoading&&(
+          <div style={{display:"flex",alignItems:"center",gap:12,padding:"16px 20px",background:T.indigoBg,border:`1px solid ${T.indigoBorder}`,borderRadius:T.radiusSm}}>
+            <div style={{width:18,height:18,border:`2px solid ${T.indigoBorder}`,borderTopColor:T.indigo,borderRadius:"50%",animation:"spin 0.8s linear infinite",flexShrink:0}}/>
+            <div style={{fontSize:12,color:T.indigo,fontWeight:600}}>Analyzing your portfolio and formulating a recommendation…</div>
+          </div>
+        )}
+
+        {/* Error */}
+        {aiError&&(
+          <div style={{padding:"12px 16px",background:T.redBg,border:`1px solid ${T.redBorder}`,borderRadius:T.radiusSm,fontSize:12,color:T.red,fontWeight:600}}>
+            ⚠ {aiError}
+          </div>
+        )}
+
+        {/* Response */}
+        {aiResponse&&(
+          <div style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,overflow:"hidden"}}>
+            <div style={{background:T.indigoBg,borderBottom:`1px solid ${T.indigoBorder}`,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{fontSize:11,fontWeight:700,color:T.indigo}}>🤖 YieldStack AI · {aiResponse.timestamp}</div>
+              <button onClick={()=>{setAiResponse(null);setAiQuestion("");}} style={{fontSize:10,color:T.textMuted,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit"}}>Clear</button>
+            </div>
+            <div style={{padding:"12px 16px",borderBottom:`1px solid ${T.borderLight}`}}>
+              <div style={{fontSize:11,color:T.textMuted,fontStyle:"italic"}}>"{aiResponse.question}"</div>
+            </div>
+            <div style={{padding:"16px"}}>
+              <div style={{fontSize:13,color:T.text,lineHeight:1.8,whiteSpace:"pre-wrap"}}>{aiResponse.answer}</div>
+            </div>
+            <div style={{padding:"10px 16px",borderTop:`1px solid ${T.borderLight}`,fontSize:10,color:T.textMuted}}>
+              Based on your live portfolio data · Not financial advice · Always verify projections
+            </div>
           </div>
         )}
       </Card>
