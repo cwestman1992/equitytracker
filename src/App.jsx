@@ -3120,6 +3120,7 @@ export default function App() {
       availableToWithdraw: calcAvailableToWithdraw(latest.gross, latest.margin, null),
       weightedMaintRate: DEFAULT_MAINTENANCE_REQ,
       actualATW: marginReport?.availableToWithdraw ?? latest?.actualATW ?? null,
+    } : null;
   }, [latest, latestHoldings, effectiveYield, settings.marginRate, settings.defaultW2, billItems, marginReport]);
   const nextBillAmt=parseNum(nextBill)||200;
   let risingStreak=0; for(let i=computed.length-1;i>=1;i--){if(computed[i].rising)risingStreak++;else break;}
