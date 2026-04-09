@@ -1535,7 +1535,7 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings, divL
                         <th style={{ padding: "8px 10px", textAlign: "right", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.green }}>TTL RTN $</th>
                         <th style={{ padding: "8px 10px", textAlign: "right", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.green }}>TTL RTN %</th>
                         <th style={{ padding: "8px 10px", textAlign: "right", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.textMuted }}>DIV RECV</th>
-                        <th style={{ padding: "8px 10px", textAlign: "right", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.textMuted }}>ADJ COST</th>
+                        <th style={{ padding: "8px 10px", textAlign: "right", fontSize: 10, fontWeight: 700, letterSpacing: "1px", color: T.textMuted }}>ADJ COST BASIS</th>
                       </>
                     ) : (
                       <SortHeader col="unrealizedGL">G/L $</SortHeader>
@@ -1575,14 +1575,20 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings, divL
                             </td>
                             <td style={{ padding: "10px 10px", textAlign: "right" }}>
                               {trData.paidForItself ? (
-                                <span style={{ background: T.green, color: "#fff", padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700 }}>PAID ✓</span>
-                              ) : (
-                                <div>
-                                  <span style={{ color: trData.adjustedCostBasis <= 0 ? T.green : T.textSub }}>{fmt$(trData.adjustedCostBasis)}</span>
-                                  {trData.recoveryPct >= 25 && trData.recoveryPct < 100 && (
-                                    <div style={{ fontSize: 9, color: T.green, marginTop: 2 }}>{trData.recoveryPct.toFixed(0)}% recv'd</div>
-                                  )}
+                                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3 }}>
+                                  <span style={{ background: T.green, color: "#fff", padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700 }}>PAID FOR ITSELF ✓</span>
+                                  <span style={{ fontSize: 9, color: T.green }}>{fmt$(trData.cashDividendsReceived)} received vs {fmt$(p.totalCost || 0)} cost</span>
                                 </div>
+                              ) : trData.recoveryPct > 0 ? (
+                                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                                  <span style={{ fontSize: 12, fontWeight: 700, color: T.textSub }}>{fmt$(Math.max(0, trData.adjustedCostBasis))}</span>
+                                  <div style={{ width: 64, height: 4, background: T.borderLight, borderRadius: 2, overflow: "hidden" }}>
+                                    <div style={{ height: "100%", width: `${Math.min(100, trData.recoveryPct)}%`, background: trData.recoveryPct >= 75 ? T.green : trData.recoveryPct >= 40 ? T.amber : T.blueMid, borderRadius: 2 }} />
+                                  </div>
+                                  <span style={{ fontSize: 9, color: T.textMuted }}>{trData.recoveryPct.toFixed(0)}% recovered</span>
+                                </div>
+                              ) : (
+                                <span style={{ color: T.textMuted, fontSize: 12 }}>{fmt$(p.totalCost || 0)}</span>
                               )}
                             </td>
                           </>
@@ -1705,8 +1711,11 @@ function HoldingsTab({ holdingSnapshots, setHoldingSnapshots, saveHoldings, divL
               </table>
             </div>
           </Card>
-
-          {/* Dividend History Section */}
+          {viewMode === "totalReturn" && (
+            <div style={{ padding: "10px 14px", background: T.surfaceAlt, border: `1px solid ${T.borderLight}`, borderRadius: T.radiusXs, fontSize: 11, color: T.textMuted, lineHeight: 1.7 }}>
+              <strong style={{ color: T.text }}>Adj. Cost Basis</strong> = original cost minus cash dividends received. When it reaches $0, the position has fully paid for itself — all remaining dividends and any market value are pure gain. The recovery bar shows progress toward that milestone. DRIP dividends don't count (they become shares, not cash).
+            </div>
+          )}
           <Card style={{ marginTop: 20 }}>
             <div onClick={() => setShowDivImport(!showDivImport)} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}>
               <div>
@@ -2309,280 +2318,6 @@ function RoutingCenterTab({ latest, settings, entries, computed, billItems, marg
       {/* Caveat */}
       <div style={{ padding: "10px 14px", background: T.amberBg, border: `1px solid ${T.amberBorder}`, borderRadius: T.radiusSm, fontSize: 11, color: T.amber, lineHeight: 1.7 }}>
         <strong>⚠ Note:</strong> Routing capacity projections assume stable NAV and pre-tax dividends. The closer you operate to 60–65% equity, the faster the system compounds — but the less margin for error on volatility. Upload the margin report frequently to keep these numbers calibrated to E-Trade's actual data.
-      </div>
-    </div>
-  );
-}
-
-// ── CAPITAL DEPLOYMENT OPTIMIZER ──────────────────────────────────────────────
-function DeployTab({ latest, settings }) {
-  const COLORS = [T.greenMid, T.blueMid, T.violet];
-  const MONTHS = 12;
-  const [amounts, setAmounts] = useState(["1000","2500","5000"]);
-  const [labels, setLabels] = useState(["Conservative","Moderate","Aggressive"]);
-
-  if (!latest) return (
-    <Card><div style={{textAlign:"center",padding:40,color:T.textMuted}}>
-      <div style={{fontSize:32,marginBottom:12}}>🚀</div>
-      <div style={{fontSize:14,fontWeight:600,color:T.textSub,marginBottom:8}}>Log at least one month to use the Deployment Optimizer</div>
-      <div style={{fontSize:12,lineHeight:1.7}}>This tool needs your portfolio balance and margin from a log entry or holdings snapshot. Once you have data, it will calculate safe deployment limits and model the Freedom Date impact of each scenario.</div>
-    </div></Card>
-  );
-
-  const { gross, margin, effectiveDivs, w2, bills } = latest;
-  const { marginRate, effectiveYield } = settings;
-  const spreadPct = Math.max(0, effectiveYield - marginRate);
-
-  // Safe margin deployment limits — max you can borrow to invest and still stay above the floor
-  // over the NEXT 12 MONTHS (not just a one-time crash snapshot).
-  // Simulates: gross += amt, margin += amt, then runs projectMinEquity over 12 months.
-  // This answers: "will I stay safe over time?" — not just "am I safe on day 1 if the market crashes?"
-  const calcSafeLimit = (floor) => {
-    let lo = 0, hi = 500000;
-    for (let i = 0; i < 60; i++) {
-      const mid = (lo + hi) / 2;
-      const minEq = projectMinEquity(gross + mid, margin + mid, effectiveDivs, w2, bills, marginRate, effectiveYield, 12);
-      if (minEq >= floor) lo = mid; else hi = mid;
-    }
-    return Math.max(0, Math.floor(lo / 50) * 50);
-  };
-  const conservativeLimit = calcSafeLimit(0.60);
-  const aggressiveLimit   = calcSafeLimit(0.55);
-
-  // Base freedom date (no additional deployment)
-  const baseFreedom = projectFreedomMonths(gross, margin, effectiveDivs, w2, bills, marginRate, effectiveYield);
-
-  const scenarios = useMemo(() => {
-    return amounts.map((amtStr, i) => {
-      const amt = parseNum(amtStr) || 0;
-      const dg = gross + amt;
-      const dm = margin + amt;
-      const postEquity   = dg > 0 ? (dg - dm) / dg : 0;
-      const stressGross  = dg * 0.85;
-      const stressEquity = stressGross > 0 ? (stressGross - dm) / stressGross : 0;
-      const monthlySpread = amt * spreadPct / 12;
-      const curve        = projectCurve(dg, dm, effectiveDivs, w2, bills, marginRate, effectiveYield, MONTHS);
-      const minEquity    = Math.min(...curve.map(p => p.equity));
-      const freedom      = projectFreedomMonths(dg, dm, effectiveDivs, w2, bills, marginRate, effectiveYield);
-      const freedomDelta = (baseFreedom != null && freedom != null) ? baseFreedom - freedom : null;
-      const stressColor  = stressEquity >= 0.60 ? T.green : stressEquity >= 0.55 ? T.amber : T.red;
-      const stressBg     = stressEquity >= 0.60 ? T.greenBg : stressEquity >= 0.55 ? T.amberBg : T.redBg;
-      const stressBorder = stressEquity >= 0.60 ? T.greenBorder : stressEquity >= 0.55 ? T.amberBorder : T.redBorder;
-      const stressSafe   = stressEquity >= 0.55;
-      const withinConservative = amt <= conservativeLimit;
-      const withinAggressive   = amt <= aggressiveLimit;
-      return { amt, label: labels[i], postEquity, stressEquity, stressColor, stressBg, stressBorder, stressSafe, monthlySpread, curve, minEquity, freedom, freedomDelta, withinConservative, withinAggressive };
-    });
-  }, [amounts, labels, gross, margin, effectiveDivs, w2, bills, marginRate, effectiveYield, spreadPct, conservativeLimit, aggressiveLimit, baseFreedom]);
-
-  const eqColor = (eq) => eq >= 0.60 ? T.green : eq >= 0.55 ? T.amber : T.red;
-
-  return (
-    <div style={{display:"flex",flexDirection:"column",gap:20}}>
-
-      {/* Current State */}
-      <Card style={{padding:"16px 24px"}}>
-        <SectionLabel>{latest.fromHoldings ? "CURRENT STATE — FROM HOLDINGS SNAPSHOT" : "CURRENT STATE — FROM LATEST LOG"}</SectionLabel>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:latest.margin > 0 ? 0 : 12}}>
-          {[
-            {l:"Gross",      v:fmt$(gross),                          c:T.text},
-            {l:"Margin",     v:fmt$(margin),                         c:margin>0?T.red:T.textMuted},
-            {l:"Equity",     v:fmtPct(latest.equity),                c:eqColor(latest.equity)},
-            {l:"Divs / Mo",  v:fmt$(effectiveDivs),                  c:T.green},
-            {l:"Yield Spread",v:`+${fmtPct(spreadPct,1)}/yr`,        c:spreadPct>0?T.green:T.red},
-          ].map(({l,v,c})=>(
-            <div key={l} style={{textAlign:"center"}}>
-              <div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:4}}>{l}</div>
-              <div style={{fontSize:14,fontWeight:700,color:c}}>{v}</div>
-            </div>
-          ))}
-        </div>
-        {margin <= 0 && (
-          <div style={{marginTop:4,padding:"8px 12px",background:T.blueBg,border:`1px solid ${T.blueBorder}`,borderRadius:T.radiusXs,fontSize:11,color:T.blue,lineHeight:1.6}}>
-            <strong>You're at $0 margin — under-leveraged relative to P2P system capacity.</strong> The scenarios below show the impact of deploying additional capital via margin borrowing. Your yield spread of {fmtPct(spreadPct,1)} means every $1 borrowed generates {fmt$(spreadPct/12,3)}/mo in net income above borrowing cost.
-          </div>
-        )}
-        {latest.actualATW != null && (
-          <div style={{marginTop:4,padding:"8px 12px",background:T.greenBg,border:`1px solid ${T.greenBorder}`,borderRadius:T.radiusXs,fontSize:11,color:T.green,lineHeight:1.6,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-            <div><strong>E-Trade Available to Withdraw: {fmt$(latest.actualATW)}</strong> — logged actual. Your safe limits above should not exceed this.</div>
-            {aggressiveLimit > latest.actualATW && <span style={{fontWeight:700,color:T.amber}}>⚠ Aggressive limit exceeds E-Trade ATW</span>}
-          </div>
-        )}
-        {latest.actualATW == null && (
-          <div style={{marginTop:4,padding:"8px 12px",background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusXs,fontSize:11,color:T.amber,lineHeight:1.6}}>
-            <strong>No E-Trade ATW logged.</strong> Log your actual Available to Withdraw (E-Trade → Accounts → Balances) when saving a monthly entry to see how your safe limits compare to what E-Trade will actually allow.
-          </div>
-        )}
-      </Card>
-
-      {/* Safe Deployment Limits */}
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
-        <div style={{background:T.greenBg,border:`1px solid ${T.greenBorder}`,borderRadius:T.radius,padding:"18px 24px"}}>
-          <div style={{fontSize:10,fontWeight:700,letterSpacing:"1.5px",color:T.green,marginBottom:4}}>CONSERVATIVE LIMIT — STAYS ABOVE 60% FOR 12 MONTHS</div>
-          <div style={{display:"flex",alignItems:"baseline",gap:8}}>
-            <div style={{fontSize:36,fontWeight:700,color:T.green,fontFamily:"'Lora', serif"}}>{conservativeLimit > 0 ? fmt$(conservativeLimit, 0) : "—"}</div>
-            {conservativeLimit > 0 && <div style={{fontSize:13,color:T.textMuted}}>max via margin</div>}
-          </div>
-          <div style={{fontSize:11,color:T.textSub,marginTop:4}}>
-            {conservativeLimit > 0
-              ? `Projects minimum equity above 60% over the next 12 months`
-              : "No headroom above 60% over 12 months at current state"}
-          </div>
-        </div>
-        <div style={{background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radius,padding:"18px 24px"}}>
-          <div style={{fontSize:10,fontWeight:700,letterSpacing:"1.5px",color:T.amber,marginBottom:4}}>AGGRESSIVE LIMIT — STAYS ABOVE 55% FOR 12 MONTHS</div>
-          <div style={{display:"flex",alignItems:"baseline",gap:8}}>
-            <div style={{fontSize:36,fontWeight:700,color:T.amber,fontFamily:"'Lora', serif"}}>{aggressiveLimit > 0 ? fmt$(aggressiveLimit, 0) : "—"}</div>
-            {aggressiveLimit > 0 && <div style={{fontSize:13,color:T.textMuted}}>max via margin</div>}
-          </div>
-          <div style={{fontSize:11,color:T.textSub,marginTop:4}}>
-            {aggressiveLimit > 0
-              ? `Projects minimum equity above 55% hard floor over 12 months`
-              : "No headroom above 55% hard floor over 12 months"}
-          </div>
-        </div>
-      </div>
-
-      {/* Scenario Builder */}
-      <Card>
-        <SectionLabel>DEPLOYMENT SCENARIO BUILDER</SectionLabel>
-        <div style={{fontSize:12,color:T.textSub,marginBottom:16,lineHeight:1.6}}>
-          Each scenario models deploying additional capital via margin. The safe limits above are based on 12-month equity projections. The stress test column in each card shows the additional one-time crash scenario — useful context, but the limits are driven by the sustained projection, not the crash.
-        </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:20}}>
-          {scenarios.map((s, i) => {
-            // Mini SVG chart — 12 months
-            const W=200,H=78,pad={t:6,b:16,l:26,r:6};
-            const iW=W-pad.l-pad.r,iH=H-pad.t-pad.b;
-            const allEqs=s.curve.map(p=>p.equity);
-            const eMin=Math.max(0,Math.min(...allEqs)-0.05),eMax=Math.min(1,Math.max(...allEqs)+0.05);
-            const eSpan=Math.max(eMax-eMin,0.05);
-            const toX=(idx)=>pad.l+(idx/(s.curve.length-1))*iW;
-            const toY=(v)=>pad.t+iH-((Math.min(1,Math.max(0,v))-eMin)/eSpan)*iH;
-            const linePath="M"+s.curve.map((p,idx)=>`${toX(idx)},${toY(p.equity)}`).join(" L");
-            return (
-              <div key={i} style={{borderRadius:T.radiusSm,padding:"16px",background:T.surfaceAlt,border:`1.5px solid ${s.stressSafe?T.border:T.redBorder}`}}>
-                {/* Header */}
-                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
-                  <div style={{width:10,height:10,borderRadius:"50%",background:COLORS[i],flexShrink:0}}/>
-                  <div style={{fontSize:12,fontWeight:700,color:COLORS[i],flex:1}}>
-                    <input value={labels[i]} onChange={e=>{const n=[...labels];n[i]=e.target.value;setLabels(n);}} style={{background:"transparent",border:"none",color:COLORS[i],fontWeight:700,fontSize:12,fontFamily:"inherit",width:"100%",outline:"none",padding:0}}/>
-                  </div>
-                  <Badge color={s.stressSafe?T.green:T.red} bg={s.stressSafe?T.greenBg:T.redBg} border={s.stressSafe?T.greenBorder:T.redBorder}>{s.stressSafe?"SAFE":"UNSAFE"}</Badge>
-                </div>
-
-                {/* Amount input */}
-                <div style={{marginBottom:14}}>
-                  <div style={{fontSize:10,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:4}}>DEPLOY VIA MARGIN</div>
-                  <div style={{display:"flex",alignItems:"center",gap:6}}>
-                    <span style={{fontSize:14,color:T.textSub,fontWeight:600}}>$</span>
-                    <input
-                      value={amounts[i]}
-                      onChange={e=>{const n=[...amounts];n[i]=e.target.value;setAmounts(n);}}
-                      style={{width:"100%",padding:"7px 10px",background:T.surface,border:`1.5px solid ${T.border}`,borderRadius:T.radiusXs,fontSize:15,fontWeight:700,color:T.text,fontFamily:"'Lora',serif",outline:"none"}}
-                      placeholder="0"
-                    />
-                  </div>
-                  {s.amt > 0 && (
-                    <div style={{fontSize:10,color:T.textMuted,marginTop:4}}>
-                      {s.withinConservative ? "✓ Within conservative limit" : s.withinAggressive ? "⚠ Within aggressive limit only" : "✗ Exceeds both safe limits"}
-                    </div>
-                  )}
-                </div>
-
-                {/* Key metrics */}
-                <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:14}}>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                    <span style={{fontSize:11,color:T.textMuted}}>Post-deploy equity</span>
-                    <span style={{fontSize:13,fontWeight:700,color:eqColor(s.postEquity)}}>{fmtPct(s.postEquity)}</span>
-                  </div>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                    <span style={{fontSize:11,color:T.textMuted}}>After 15% crash</span>
-                    <span style={{fontSize:13,fontWeight:700,color:s.stressColor,padding:"1px 8px",background:s.stressBg,borderRadius:10,border:`1px solid ${s.stressBorder}`}}>{fmtPct(s.stressEquity)}</span>
-                  </div>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                    <span style={{fontSize:11,color:T.textMuted}}>Net spread / mo</span>
-                    <span style={{fontSize:13,fontWeight:700,color:s.monthlySpread>0?T.green:T.textMuted}}>{s.monthlySpread>0?`+${fmt$(s.monthlySpread,0)}`:"—"}</span>
-                  </div>
-                  <div style={{height:1,background:T.border,margin:"2px 0"}}/>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                    <span style={{fontSize:11,color:T.textMuted}}>Freedom Date</span>
-                    <span style={{fontSize:12,fontWeight:700,color:T.text}}>{s.freedom ? getFreedomDate(s.freedom) : "—"}</span>
-                  </div>
-                  {s.freedomDelta !== null && (
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                      <span style={{fontSize:11,color:T.textMuted}}>vs no deployment</span>
-                      <span style={{fontSize:12,fontWeight:700,color:s.freedomDelta>0?T.green:s.freedomDelta<0?T.red:T.textMuted}}>
-                        {s.freedomDelta>0?`−${s.freedomDelta} mo earlier`:s.freedomDelta<0?`+${Math.abs(s.freedomDelta)} mo later`:"No change"}
-                      </span>
-                    </div>
-                  )}
-                </div>
-
-                {/* Mini 12-month chart */}
-                <div style={{borderTop:`1px solid ${T.border}`,paddingTop:10}}>
-                  <div style={{fontSize:9,color:T.textMuted,fontWeight:600,letterSpacing:"1px",marginBottom:4}}>12-MONTH EQUITY TRAJECTORY</div>
-                  <svg width={W} height={H} style={{width:"100%",height:"auto"}}>
-                    {[0.60,0.55].map(v=>{
-                      if(v<eMin-0.01||v>eMax+0.01)return null;
-                      return <g key={v}>
-                        <line x1={pad.l} x2={pad.l+iW} y1={toY(v)} y2={toY(v)} stroke={v===0.60?T.greenMid:T.amberMid} strokeWidth={1} strokeDasharray="4,3" opacity={0.7}/>
-                        <text x={pad.l-3} y={toY(v)+4} textAnchor="end" fill={v===0.60?T.greenMid:T.amberMid} fontSize="7" fontFamily="Nunito" fontWeight="700">{v*100}%</text>
-                      </g>;
-                    })}
-                    {[0,6,12].map(m=>(
-                      <text key={m} x={toX(m)} y={H-2} textAnchor="middle" fill={T.textMuted} fontSize="7" fontFamily="Nunito">{m===0?"Now":`${m}mo`}</text>
-                    ))}
-                    <path d={linePath+` L${toX(s.curve.length-1)},${pad.t+iH} L${toX(0)},${pad.t+iH} Z`} fill={COLORS[i]} opacity={0.08}/>
-                    <path d={linePath} fill="none" stroke={COLORS[i]} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                    {[0,6,12].filter(m=>m<s.curve.length).map(m=>(
-                      <circle key={m} cx={toX(m)} cy={toY(s.curve[m].equity)} r="3" fill={COLORS[i]} stroke={T.surface} strokeWidth="1.5"/>
-                    ))}
-                  </svg>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </Card>
-
-      {/* Suggested B1/B2/B3 Allocation */}
-      <Card>
-        <SectionLabel>SUGGESTED ALLOCATION — WHERE TO PUT DEPLOYED CAPITAL</SectionLabel>
-        <div style={{fontSize:12,color:T.textSub,marginBottom:16,lineHeight:1.6}}>
-          At your current stage (early accumulation, building income), prioritize B3 for maximum dividend generation. The yield spread only works when capital is in high-yield positions.
-        </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
-          {[
-            {bucket:"B1",label:"Growth Anchors",icon:"📈",pct:0.15,color:T.blue,bg:T.blueBg,border:T.blueBorder,note:"SPYG, TQQQ — NAV stability, long-term appreciation"},
-            {bucket:"B2",label:"CEF Compounders",icon:"🏦",pct:0.15,color:T.violet,bg:T.violetBg,border:T.violetBorder,note:"CLM, CRF — DRIP at NAV discount, steady compounding"},
-            {bucket:"B3",label:"High-Yield Workhorses",icon:"⚡",pct:0.70,color:T.green,bg:T.greenBg,border:T.greenBorder,note:"QDTE, XDTE, QQQI — maximum income generation"},
-          ].map(({bucket,label,icon,pct,color,bg,border,note})=>{
-            const deployAmt = parseNum(amounts[1]) || 0; // Use middle scenario as reference
-            const allocated = deployAmt * pct;
-            return (
-              <div key={bucket} style={{background:bg,border:`1px solid ${border}`,borderRadius:T.radiusSm,padding:"16px"}}>
-                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-                  <span style={{fontSize:18}}>{icon}</span>
-                  <div>
-                    <div style={{fontSize:11,fontWeight:700,color,letterSpacing:"0.5px"}}>{bucket} — {label}</div>
-                  </div>
-                </div>
-                <div style={{fontSize:28,fontWeight:700,color,fontFamily:"'Lora',serif",marginBottom:4}}>{fmtPct(pct,0)}</div>
-                {deployAmt > 0 && <div style={{fontSize:12,fontWeight:600,color,marginBottom:6}}>{fmt$(allocated,0)} of {fmt$(deployAmt,0)}</div>}
-                <div style={{fontSize:11,color:T.textSub,lineHeight:1.5}}>{note}</div>
-              </div>
-            );
-          })}
-        </div>
-        <div style={{marginTop:12,padding:"10px 14px",background:T.surfaceAlt,borderRadius:T.radiusXs,fontSize:11,color:T.textSub,lineHeight:1.6}}>
-          <strong style={{color:T.text}}>Note:</strong> These are starting-point guidelines, not hard rules. Adjust based on your current bucket weights in the Holdings tab. B3 allocation assumes you're comfortable with NAV erosion as a feature — these positions trade price stability for income.
-        </div>
-      </Card>
-
-      {/* Projection caveat */}
-      <div style={{padding:"12px 16px",background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusSm,fontSize:11,color:T.amber,lineHeight:1.7}}>
-        <strong>⚠ Projection Limitations:</strong> Freedom Date calculations assume stable NAV (B3 positions erode over time) and that 100% of dividends are available (pre-tax). Stress test models a one-time 15% crash immediately after deployment — actual drawdowns vary. Use these numbers as relative comparisons, not precise predictions.
       </div>
     </div>
   );
@@ -3405,6 +3140,58 @@ export default function App() {
   const monthsToTrigger=equityMomAvg>0&&currentSnapshot&&!cond1?Math.ceil((0.60-currentSnapshot.equity)/equityMomAvg):null;
   const eqColor=(eq)=>eq>=0.60?T.green:eq>=0.55?T.amber:T.red;
 
+  // ── EARLY WARNING SYSTEM ─────────────────────────────────────────────────────
+  // Silent 95% of the time. Each warning has: id, severity (red|amber|blue), icon, message, action label, actionTab
+  const earlyWarnings = useMemo(() => {
+    if (!currentSnapshot) return [];
+    const warnings = [];
+    const eq = currentSnapshot.equity;
+    const margin = currentSnapshot.margin;
+    const gross = currentSnapshot.gross;
+
+    // 1. Equity approaching 60% trigger — warn at 65%
+    if (eq >= 0.55 && eq < 0.65 && margin > 0) {
+      warnings.push({ id: "eq-low", severity: "amber", icon: "⚠", message: `Equity at ${fmtPct(eq)} — approaching 60% trigger. Pause bill-adding until equity recovers.`, actionLabel: "Stress Test", actionTab: "stress" });
+    }
+    // 2. Equity at or below 55% hard floor
+    if (eq < 0.55 && margin > 0) {
+      warnings.push({ id: "eq-floor", severity: "red", icon: "🚨", message: `Equity at ${fmtPct(eq)} — below 55% hard floor. Review positions and avoid adding margin.`, actionLabel: "Stress Test", actionTab: "stress" });
+    }
+    // 3. Rising streak broken — was rising, now declining
+    if (computed.length >= 2 && risingStreak === 0) {
+      const last = computed[computed.length - 1];
+      if (last?.rising === false) {
+        warnings.push({ id: "streak-broken", severity: "amber", icon: "📉", message: "Rising streak broken — equity declined last month. Streak resets. Watch next month before adding bills.", actionLabel: "History", actionTab: "log" });
+      }
+    }
+    // 4. Margin rate at default (not negotiated) — if above 10%
+    if (settings.marginRate > 0.10) {
+      warnings.push({ id: "margin-rate", severity: "amber", icon: "📞", message: `Margin rate is ${fmtPct(settings.marginRate)} — call E-Trade to negotiate the active trader rate (~8.44%). Worth $55K+ over 10 years.`, actionLabel: "Settings", actionTab: "settings" });
+    }
+    // 5. Stale margin report — uploaded more than 7 days ago
+    if (marginReport) {
+      const ageDays = (Date.now() - new Date(marginReport.uploadedAt).getTime()) / 86400000;
+      if (ageDays > 7) {
+        warnings.push({ id: "stale-margin", severity: "blue", icon: "📋", message: `Margin report is ${Math.floor(ageDays)} days old. Upload a fresh one for accurate routing capacity and ATW.`, actionLabel: "Routing Center", actionTab: "routing" });
+      }
+    } else if (currentSnapshot && margin > 0) {
+      // No margin report ever uploaded
+      warnings.push({ id: "no-margin-report", severity: "blue", icon: "📋", message: "Upload E-Trade's margin CSV for accurate Available to Withdraw and routing capacity.", actionLabel: "Routing Center", actionTab: "routing" });
+    }
+    // 6. Coverage milestone reached — positive signal
+    const cov = currentSnapshot.coverage;
+    const lastLoggedCov = computed.length >= 2 ? computed[computed.length-2]?.coverage : null;
+    if (lastLoggedCov !== null && lastLoggedCov < 0.25 && cov >= 0.25) {
+      warnings.push({ id: "cov-25", severity: "green", icon: "🎉", message: "Coverage milestone: dividends now cover 25% of bills. Getting established!", actionLabel: null, actionTab: null });
+    } else if (lastLoggedCov !== null && lastLoggedCov < 0.50 && cov >= 0.50) {
+      warnings.push({ id: "cov-50", severity: "green", icon: "🎉", message: "Coverage milestone: dividends cover 50% of bills. Comfortable to add medium bills.", actionLabel: null, actionTab: null });
+    } else if (lastLoggedCov !== null && lastLoggedCov < 0.75 && cov >= 0.75) {
+      warnings.push({ id: "cov-75", severity: "green", icon: "🎉", message: "Coverage milestone: dividends cover 75% of bills. Strong position — system compounding well.", actionLabel: null, actionTab: null });
+    }
+
+    return warnings;
+  }, [currentSnapshot, computed, risingStreak, settings.marginRate, marginReport]);
+
   const openAdd=()=>{
     setEditIdx(null);
     setForm({
@@ -3502,7 +3289,7 @@ export default function App() {
   const linePath=computed.length>1?"M"+computed.map((e,i)=>`${toX(i)},${toY(e.equity)}`).join(" L"):null;
   const areaPath=linePath?linePath+` L${toX(computed.length-1)},${cPad.t+ciH} L${toX(0)},${cPad.t+ciH} Z`:null;
 
-  const TABS=[["dashboard","Overview"],["routing","Routing Center"],["modeler","Bill Modeler"],["bills","Bill Tracker"],["holdings","Holdings"],["dividends","Dividends"],["deploy","Deploy"],["stress","Stress Test"],["metrics","Metrics"],["log","History"],["settings","Settings"],["help","Help"]];
+  const TABS=[["dashboard","Overview"],["routing","Routing Center"],["modeler","Bill Modeler"],["bills","Bill Tracker"],["holdings","Holdings"],["dividends","Dividends"],["stress","Stress Test"],["metrics","Metrics"],["log","History"],["settings","Settings"],["help","Help"]];
 
   return(
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'Nunito', 'Helvetica Neue', Arial, sans-serif"}}>
@@ -3544,6 +3331,7 @@ export default function App() {
         <div style={{maxWidth:1280,margin:"0 auto",padding:"0 32px",display:"flex",gap:0,minWidth:"max-content"}}>
           {TABS.map(([id,label])=>(
             <button key={id} onClick={()=>setActiveTab(id)} style={{padding:"14px 16px",background:"transparent",border:"none",borderBottom:`2.5px solid ${activeTab===id?T.text:"transparent"}`,color:activeTab===id?T.text:T.textMuted,fontFamily:"inherit",fontSize:13,fontWeight:activeTab===id?700:500,transition:"all 0.18s",whiteSpace:"nowrap"}}>
+              {id==="routing"&&earlyWarnings.filter(w=>w.severity!=="green").length>0&&<span style={{fontSize:9,fontWeight:700,padding:"1px 5px",borderRadius:10,background:T.amberBg,color:T.amber,border:`1px solid ${T.amberBorder}`,marginRight:5}}>{earlyWarnings.filter(w=>w.severity!=="green").length}</span>}
               {id==="bills"&&billItems.length>0&&<span style={{fontSize:9,fontWeight:700,padding:"1px 5px",borderRadius:10,background:T.greenBg,color:T.green,border:`1px solid ${T.greenBorder}`,marginRight:5}}>{billItems.filter(b=>b.isFloated).length}/{billItems.length}</span>}
               {id==="holdings"&&holdingSnapshots.length>0&&<span style={{fontSize:9,fontWeight:700,padding:"1px 5px",borderRadius:10,background:T.indigoBg,color:T.indigo,border:`1px solid ${T.indigoBorder}`,marginRight:5}}>{holdingSnapshots.length}</span>}
               {label}
@@ -3568,6 +3356,30 @@ export default function App() {
               {currentSnapshot?.fromHoldings&&currentSnapshot?.marginIsEstimated&&(
                 <div style={{background:T.amberBg,border:`1px solid ${T.amberBorder}`,borderRadius:T.radiusSm,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <div style={{fontSize:11,color:T.amber,fontWeight:600}}>⚠ Margin debt carried from last log entry ({fmt$(currentSnapshot.margin)}) — CSV exports don't include margin. Upload a PDF statement or click "Log from Holdings" to enter your current margin balance.</div>
+                </div>
+              )}
+              {/* Early Warning System */}
+              {earlyWarnings.length > 0 && (
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  {earlyWarnings.map(w => {
+                    const colors = w.severity === "red"   ? { bg: T.redBg,   border: T.redBorder,   text: T.red,   badge: "#fff" }
+                                 : w.severity === "amber" ? { bg: T.amberBg, border: T.amberBorder, text: T.amber, badge: "#fff" }
+                                 : w.severity === "green" ? { bg: T.greenBg, border: T.greenBorder, text: T.green, badge: "#fff" }
+                                 :                          { bg: T.blueBg,  border: T.blueBorder,  text: T.blue,  badge: "#fff" };
+                    return (
+                      <div key={w.id} style={{background:colors.bg,border:`1px solid ${colors.border}`,borderRadius:T.radiusSm,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+                        <div style={{display:"flex",alignItems:"center",gap:10,flex:1}}>
+                          <span style={{fontSize:16,flexShrink:0}}>{w.icon}</span>
+                          <span style={{fontSize:12,color:colors.text,lineHeight:1.5}}>{w.message}</span>
+                        </div>
+                        {w.actionLabel && (
+                          <button onClick={()=>setActiveTab(w.actionTab)} style={{flexShrink:0,padding:"4px 12px",background:colors.text,color:"#fff",border:"none",borderRadius:T.radiusXs,fontSize:11,fontWeight:700,fontFamily:"inherit",cursor:"pointer",whiteSpace:"nowrap"}}>
+                            {w.actionLabel} →
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
               {/* Portfolio Total Return Card */}
@@ -3706,7 +3518,6 @@ export default function App() {
         {activeTab==="holdings"&&<HoldingsTab holdingSnapshots={holdingSnapshots} setHoldingSnapshots={setHoldingSnapshots} saveHoldings={saveHoldings} divLedger={divLedger} saveDivLedger={saveDivLedger} settings={fullSettings} saveSettings={setSettings}/>}
         {activeTab==="dividends"&&<DividendsTab computed={computed}/>}
         {activeTab==="routing"&&<RoutingCenterTab latest={currentSnapshot} settings={fullSettings} entries={entries} computed={computed} billItems={billItems} marginReport={marginReport} saveMarginReport={saveMarginReport}/>}
-        {activeTab==="deploy"&&<DeployTab latest={currentSnapshot} settings={fullSettings}/>}
         {activeTab==="stress"&&<StressTestTab latest={currentSnapshot} settings={fullSettings} positions={latestHoldings?.positions||null}/>}
 
         {activeTab==="metrics"&&(
